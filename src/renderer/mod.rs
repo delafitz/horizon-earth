@@ -57,10 +57,17 @@ const ATTRS_MARKER_INST: [wgpu::VertexAttribute; 2] =
 const ATTRS_THICK_INST: [wgpu::VertexAttribute; 3] =
     wgpu::vertex_attr_array![1 => Float32x3, 2 => Float32x3, 3 => Float32x4];
 
-// Default coastline / border line widths (px). The egui panel can override
-// these via style1.z / style1.w; kept as constants until that slider lands.
-const COAST_WIDTH_PX: f32 = 2.0;
-const BORDER_WIDTH_PX: f32 = 1.4;
+// Ground anchors: nadir drop-lines + footprint rings, reusing the thick-line
+// instance/shader. Width/alpha live in style2.x / style2.y so the egui panel can
+// drive them later. The footprint is the physical horizon circle (angular radius
+// from altitude); `RING_SEGMENTS` points per ring.
+const GROUND_WIDTH_PX: f32 = 1.5;
+const GROUND_ALPHA: f32 = 0.5;
+const RING_SEGMENTS: usize = 48;
+// Surface radius for ground geometry: just above the globe and land fill.
+const GROUND_RADIUS: f32 = 1.0015;
+// Layer value selecting the ground width in the thick-line shader.
+const LAYER_GROUND: f32 = 2.0;
 
 // On-screen half-size of a body marker, in NDC units.
 const MARKER_SIZE: f32 = 0.01;
@@ -83,7 +90,9 @@ struct Uniforms {
     // unaffected (each shader declares only the prefix it needs).
     style0: [f32; 4], // x = far-side line alpha, y = land fill alpha,
     // z = orbit-track alpha, w = line brightness
-    style1: [f32; 4], // x = atmosphere intensity, y = atmosphere outer radius
+    style1: [f32; 4], // x = atmosphere intensity, y = atmosphere outer radius,
+    // z = coastline width px, w = border width px
+    style2: [f32; 4], // x = ground-line width px, y = ground-line alpha
 }
 
 pub struct Renderer {
@@ -102,6 +111,8 @@ pub struct Renderer {
     fill_pipeline: wgpu::RenderPipeline,
     lines_back_pipeline: wgpu::RenderPipeline,
     lines_pipeline: wgpu::RenderPipeline,
+    ground_pipeline: wgpu::RenderPipeline,
+    ground_back_pipeline: wgpu::RenderPipeline,
     atmosphere_pipeline: wgpu::RenderPipeline,
     track_back_pipeline: wgpu::RenderPipeline,
     track_pipeline: wgpu::RenderPipeline,
@@ -118,6 +129,11 @@ pub struct Renderer {
     line_quad_vbuf: wgpu::Buffer,
     line_vbuf: wgpu::Buffer,
     line_vcount: u32,
+
+    // Ground anchors (nadir lines + footprint rings), rebuilt each frame since
+    // the satellites move. Shares `line_quad_vbuf` for the expansion quad.
+    ground_inst_buf: wgpu::Buffer,
+    ground_count: u32,
 
     fill_vbuf: wgpu::Buffer,
     fill_vcount: u32,
@@ -366,9 +382,26 @@ impl Renderer {
         );
         let lines_pipeline = make_pipeline(
             &device, &pipeline_layout, &thick_lines_sh, format,
-            &[corner_layout.clone(), thick_inst_layout],
+            &[corner_layout.clone(), thick_inst_layout.clone()],
             wgpu::PrimitiveTopology::TriangleList, None, true,
             wgpu::CompareFunction::LessEqual, "fs_main",
+        );
+        // Ground anchors (nadir lines + footprint rings): same thick-line shader,
+        // alpha-blended, no depth write (so they never occlude markers/labels).
+        // Near pass shows the front side; far pass is dimmed "through the glass".
+        let ground_back_pipeline = make_pipeline(
+            &device, &pipeline_layout, &thick_lines_sh, format,
+            &[corner_layout.clone(), thick_inst_layout.clone()],
+            wgpu::PrimitiveTopology::TriangleList,
+            Some(wgpu::BlendState::ALPHA_BLENDING), false,
+            wgpu::CompareFunction::Greater, "fs_ground_back",
+        );
+        let ground_pipeline = make_pipeline(
+            &device, &pipeline_layout, &thick_lines_sh, format,
+            &[corner_layout.clone(), thick_inst_layout],
+            wgpu::PrimitiveTopology::TriangleList,
+            Some(wgpu::BlendState::ALPHA_BLENDING), false,
+            wgpu::CompareFunction::LessEqual, "fs_ground",
         );
         let atmosphere_pipeline = make_pipeline(
             &device, &pipeline_layout, &atmo_sh, format, &[pos_layout],
@@ -582,6 +615,17 @@ impl Renderer {
             mapped_at_creation: false,
         });
 
+        // One nadir line + a footprint ring per body, refilled in `update`.
+        let ground_per_body = 1 + RING_SEGMENTS;
+        let ground_inst_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("ground-instances"),
+            size: (world.bodies.len().max(1)
+                * ground_per_body
+                * std::mem::size_of::<mesh::ThickLineInstance>()) as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
         // [egui] Painter targeting the same surface format; no depth, no MSAA.
         let egui_renderer = egui_wgpu::Renderer::new(&device, format, None, 1, false);
 
@@ -598,6 +642,8 @@ impl Renderer {
             fill_pipeline,
             lines_back_pipeline,
             lines_pipeline,
+            ground_pipeline,
+            ground_back_pipeline,
             atmosphere_pipeline,
             track_back_pipeline,
             track_pipeline,
@@ -612,6 +658,8 @@ impl Renderer {
             line_quad_vbuf,
             line_vbuf,
             line_vcount,
+            ground_inst_buf,
+            ground_count: 0,
             fill_vbuf,
             fill_vcount,
             track_vbuf,
@@ -657,6 +705,20 @@ impl Renderer {
     /// [egui] Copy the current UI-driven parameters in; read during update/render.
     pub fn set_settings(&mut self, settings: RenderSettings) {
         self.settings = settings;
+    }
+
+    /// [egui] Swap in a new set of bodies (e.g. after re-sampling the group),
+    /// resizing the per-body marker buffer and rebuilding the orbit tracks. The
+    /// marker instances themselves are refilled by the next `update`.
+    pub fn set_world(&mut self, world: World) {
+        self.world = world;
+        self.marker_inst_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("marker-instances"),
+            size: (self.world.bodies.len().max(1) * std::mem::size_of::<MarkerInstance>()) as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        self.rebuild_tracks();
     }
 
     /// Read-only access to the simulated world (for the UI panels).
@@ -748,8 +810,14 @@ impl Renderer {
             cam_pos: [eye.x, eye.y, eye.z, 1.0],
             params: [aspect, width, height, 0.0],
             style0: [s.line_back_alpha, s.fill_alpha, s.track_alpha, s.line_brightness],
-            // z = coastline width px, w = border width px (egui may override).
-            style1: [s.atmo_intensity, 1.0 + s.atmo_thickness, COAST_WIDTH_PX, BORDER_WIDTH_PX],
+            // z = coastline width px, w = border width px (0 hides the layer).
+            style1: [
+                s.atmo_intensity,
+                1.0 + s.atmo_thickness,
+                s.coast_width_px(),
+                s.border_width_px(),
+            ],
+            style2: [GROUND_WIDTH_PX, GROUND_ALPHA, 0.0, 0.0],
         };
         self.queue
             .write_buffer(&self.uniform_buf, 0, bytemuck::cast_slice(&[u]));
@@ -777,6 +845,55 @@ impl Renderer {
             .collect();
         self.queue
             .write_buffer(&self.marker_inst_buf, 0, bytemuck::cast_slice(&instances));
+
+        // Ground anchors: a nadir drop-line + footprint ring per body, in the
+        // body's category colour. Built in the inertial frame like the markers,
+        // then pre-rotated by -spin so the shared thick-line shader's model
+        // (GMST) spin cancels — keeping them pinned directly under each body.
+        let unspin = glam::Mat3::from_rotation_y(-spin);
+        let mut ground: Vec<mesh::ThickLineInstance> = Vec::new();
+        for i in 0..self.world.bodies.len() {
+            let p = eci_to_world(self.world.body_position_eci(i)).as_vec3();
+            let r = p.length();
+            if r <= 1.0 {
+                continue; // body at/under the surface: nothing to anchor
+            }
+            let c = self.world.bodies[i].color;
+            let col_layer = [c[0], c[1], c[2], LAYER_GROUND];
+            let n = p / r;
+            let push = |out: &mut Vec<mesh::ThickLineInstance>, a: Vec3, b: Vec3| {
+                out.push(mesh::ThickLineInstance {
+                    p0: (unspin * a).to_array(),
+                    p1: (unspin * b).to_array(),
+                    col_layer,
+                });
+            };
+            // Nadir drop-line: from the satellite to the surface point below it.
+            push(&mut ground, p, n * GROUND_RADIUS);
+            // Footprint ring: the horizon circle, angular radius acos(R/r) about
+            // the nadir direction — so higher orbits draw visibly larger rings.
+            let theta = (1.0 / r).clamp(-1.0, 1.0).acos();
+            let seed = if n.x.abs() < 0.9 { Vec3::X } else { Vec3::Y };
+            let t = (seed - n * n.dot(seed)).normalize();
+            let bvec = n.cross(t);
+            let (st, ct) = theta.sin_cos();
+            let ring_pt = |phi: f32| {
+                let (sp, cp) = phi.sin_cos();
+                (n * ct + (t * cp + bvec * sp) * st) * GROUND_RADIUS
+            };
+            let mut prev = ring_pt(0.0);
+            for k in 1..=RING_SEGMENTS {
+                let phi = k as f32 / RING_SEGMENTS as f32 * std::f32::consts::TAU;
+                let cur = ring_pt(phi);
+                push(&mut ground, prev, cur);
+                prev = cur;
+            }
+        }
+        self.ground_count = ground.len() as u32;
+        if !ground.is_empty() {
+            self.queue
+                .write_buffer(&self.ground_inst_buf, 0, bytemuck::cast_slice(&ground));
+        }
 
         // [egui] Rebuild orbit tracks only when the per-type selection changes.
         let mask = self.settings.track_mask();
@@ -947,6 +1064,14 @@ impl Renderer {
                 rp.draw(0..6, 0..body_count);
             }
 
+            // Ground anchors behind the globe (faint, "through the glass").
+            if self.ground_count > 0 {
+                rp.set_pipeline(&self.ground_back_pipeline);
+                rp.set_vertex_buffer(0, self.line_quad_vbuf.slice(..));
+                rp.set_vertex_buffer(1, self.ground_inst_buf.slice(..));
+                rp.draw(0..6, 0..self.ground_count);
+            }
+
             // --- Near side: full intensity -----------------------------------
             // Translucent land fill, under the coastlines/borders.
             if self.fill_vcount > 0 {
@@ -961,6 +1086,14 @@ impl Renderer {
                 rp.set_vertex_buffer(0, self.line_quad_vbuf.slice(..));
                 rp.set_vertex_buffer(1, self.line_vbuf.slice(..));
                 rp.draw(0..6, 0..self.line_vcount);
+            }
+
+            // Ground anchors (nadir drop-lines + footprint rings), near side.
+            if self.ground_count > 0 {
+                rp.set_pipeline(&self.ground_pipeline);
+                rp.set_vertex_buffer(0, self.line_quad_vbuf.slice(..));
+                rp.set_vertex_buffer(1, self.ground_inst_buf.slice(..));
+                rp.draw(0..6, 0..self.ground_count);
             }
 
             // Orbit tracks.

@@ -41,10 +41,10 @@ fn now_epoch() -> Epoch {
 /// How long a cached TLE set is considered fresh.
 const TLE_MAX_AGE: Duration = Duration::from_secs(6 * 3600);
 
-/// Randomly choose `n` of `els` via a partial Fisher–Yates shuffle, seeded from
-/// the wall clock so each run differs. Assumes `n < els.len()` (the caller
-/// checks); returns the first `n` after shuffling those slots.
-fn sample_elements(mut els: Vec<horizon_core::Elements>, n: usize) -> Vec<horizon_core::Elements> {
+/// Randomly choose `n` distinct elements of `els`, seeded from the wall clock so
+/// each call differs. Assumes `n < els.len()` (the caller checks); picks indices
+/// via a partial Fisher–Yates over an index array and clones the chosen sets.
+fn sample_elements(els: &[horizon_core::Elements], n: usize) -> Vec<horizon_core::Elements> {
     // xorshift64* — tiny, dependency-free; seed must be non-zero.
     let mut state = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -57,13 +57,12 @@ fn sample_elements(mut els: Vec<horizon_core::Elements>, n: usize) -> Vec<horizo
         state ^= state >> 27;
         state.wrapping_mul(0x2545F4914F6CDD1D)
     };
-    let len = els.len();
+    let mut idx: Vec<usize> = (0..els.len()).collect();
     for i in 0..n {
-        let j = i + (next() as usize) % (len - i);
-        els.swap(i, j);
+        let j = i + (next() as usize) % (els.len() - i);
+        idx.swap(i, j);
     }
-    els.truncate(n);
-    els
+    idx[..n].iter().map(|&k| els[k].clone()).collect()
 }
 
 pub struct App {
@@ -74,8 +73,11 @@ pub struct App {
     time_mode: TimeMode,
     group: String,
     offline: bool,
-    /// If set, show a random subset of this many objects from the group.
+    /// If set, the initial random-subset size shown from the group.
     sample: Option<usize>,
+    /// All element sets loaded for the group; re-sampled when the panel slider
+    /// changes the shown count.
+    elements: Vec<horizon_core::Elements>,
     last_cursor: Option<(f64, f64)>,
     dragging: bool,
     no_exit: bool,
@@ -108,6 +110,7 @@ impl App {
             group,
             offline,
             sample,
+            elements: Vec::new(),
             last_cursor: None,
             dragging: false,
             no_exit,
@@ -130,9 +133,9 @@ impl App {
         }
     }
 
-    /// Build the world: real tracked objects (CelesTrak group), falling back to
-    /// the synthetic demo constellation if offline or the fetch yields nothing.
-    fn build_world(&self) -> World {
+    /// Load the configured group's element sets (fresh cache → network → stale),
+    /// returning an empty vec on failure (the caller drops to the demo world).
+    fn load_elements(&self) -> Vec<horizon_core::Elements> {
         let cache = Path::new("cache");
         let loaded = if self.offline {
             horizon_data::load_cached(&self.group, cache)
@@ -140,25 +143,35 @@ impl App {
             horizon_data::load_group(&self.group, cache, TLE_MAX_AGE)
         };
         match loaded {
-            Ok(mut els) => {
-                // Optionally show a random subset (e.g. 200 of ~6500 Starlink).
-                if let Some(n) = self.sample {
-                    if n < els.len() {
-                        let total = els.len();
-                        els = sample_elements(els, n);
-                        log::info!("sampled {} of {} '{}' objects", els.len(), total, self.group);
-                    }
-                }
-                let bodies = bodies_from_elements(&els);
-                if !bodies.is_empty() {
-                    log::info!("tracking {} objects from '{}'", bodies.len(), self.group);
-                    return World::new(self.epoch0, bodies);
-                }
-                log::warn!("group '{}' produced no usable bodies; using demo", self.group);
+            Ok(els) => els,
+            Err(e) => {
+                log::warn!("TLE load failed ({e}); using demo constellation");
+                Vec::new()
             }
-            Err(e) => log::warn!("TLE load failed ({e}); using demo constellation"),
         }
-        World::demo(self.epoch0)
+    }
+
+    /// Build the world from a random `n`-object sample of the loaded elements
+    /// (all of them when `n >= total`), falling back to the demo constellation
+    /// when nothing usable is available.
+    fn world_from_count(&self, n: usize) -> World {
+        if self.elements.is_empty() {
+            return World::demo(self.epoch0);
+        }
+        let els = if n < self.elements.len() {
+            let s = sample_elements(&self.elements, n);
+            log::info!("sampled {} of {} '{}' objects", s.len(), self.elements.len(), self.group);
+            s
+        } else {
+            self.elements.clone()
+        };
+        let bodies = bodies_from_elements(&els);
+        if bodies.is_empty() {
+            log::warn!("group '{}' produced no usable bodies; using demo", self.group);
+            return World::demo(self.epoch0);
+        }
+        log::info!("tracking {} objects from '{}'", bodies.len(), self.group);
+        World::new(self.epoch0, bodies)
     }
 
     /// Interactive keyboard shortcuts (not consumed by egui).
@@ -225,6 +238,16 @@ impl App {
             self.time_mode = want;
             self.start = Instant::now();
             self.epoch0 = now_epoch();
+        }
+
+        // Re-sample the group when the panel slider committed a new count.
+        if self.ui.resample {
+            self.ui.resample = false;
+            self.ui.selected = None;
+            let world = self.world_from_count(self.ui.sample_count);
+            if let Some(r) = self.renderer.as_mut() {
+                r.set_world(world);
+            }
         }
 
         let now = self.current_epoch();
@@ -328,7 +351,17 @@ impl ApplicationHandler for App {
 
         self.start = Instant::now();
         self.epoch0 = now_epoch();
-        let world = self.build_world();
+
+        // Load the group once; the panel slider re-samples from this set live.
+        self.elements = self.load_elements();
+        let total = self.elements.len();
+        let initial = match self.sample {
+            Some(n) if total > 0 => n.clamp(1, total),
+            _ => total,
+        };
+        self.ui.sample_total = total;
+        self.ui.sample_count = initial;
+        let world = self.world_from_count(initial);
         let renderer = pollster::block_on(Renderer::new(window.clone(), world));
 
         self.last_cursor = None;

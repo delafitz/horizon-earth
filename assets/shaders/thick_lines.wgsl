@@ -12,6 +12,8 @@ struct U {
     style0: vec4<f32>,
     // [egui] z = coastline width (px), w = border width (px).
     style1: vec4<f32>,
+    // [egui] x = ground-line width (px), y = ground-line alpha.
+    style2: vec4<f32>,
 };
 @group(0) @binding(0) var<uniform> u: U;
 
@@ -44,7 +46,13 @@ fn vs_main(
     let dir = normalize(d);
     let perp = vec2<f32>(-dir.y, dir.x);
 
-    let width_px = select(u.style1.z, u.style1.w, col_layer.w > 0.5);
+    // layer: 0 = coastline, 1 = border, 2 = ground anchor.
+    var width_px = u.style1.z;
+    if (col_layer.w > 1.5) {
+        width_px = u.style2.x;
+    } else if (col_layer.w > 0.5) {
+        width_px = u.style1.w;
+    }
     var c = select(c0, c1, corner.x > 0.5);
     // Pixel offset -> NDC (componentwise 2/res), carried into clip by * c.w.
     let offset_ndc = perp * corner.y * (width_px * 0.5) * 2.0 / res;
@@ -65,4 +73,16 @@ fn fs_main(in: VOut) -> @location(0) vec4<f32> {
 @fragment
 fn fs_back(in: VOut) -> @location(0) vec4<f32> {
     return vec4<f32>(in.col * u.style0.w, u.style0.x);
+}
+
+// Ground anchors (nadir lines + footprint rings): alpha-blended in the body's
+// category colour. Near pass at full ground alpha, far pass dimmed.
+@fragment
+fn fs_ground(in: VOut) -> @location(0) vec4<f32> {
+    return vec4<f32>(in.col, u.style2.y);
+}
+
+@fragment
+fn fs_ground_back(in: VOut) -> @location(0) vec4<f32> {
+    return vec4<f32>(in.col, u.style2.y * 0.35);
 }

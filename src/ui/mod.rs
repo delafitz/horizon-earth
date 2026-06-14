@@ -35,6 +35,12 @@ pub struct RenderSettings {
     pub line_back_alpha: f32,
     /// Opacity of the translucent land fill.
     pub fill_alpha: f32,
+    pub coast_visible: bool,
+    /// Coastline stroke width in pixels.
+    pub coast_width: f32,
+    pub border_visible: bool,
+    /// Country-border stroke width in pixels.
+    pub border_width: f32,
 
     // --- Atmosphere ---
     pub show_atmosphere: bool,
@@ -55,6 +61,10 @@ impl Default for RenderSettings {
             line_brightness: 1.0,
             line_back_alpha: 0.28,
             fill_alpha: 0.20,
+            coast_visible: true,
+            coast_width: 2.0,
+            border_visible: true,
+            border_width: 1.4,
             show_atmosphere: true,
             atmo_intensity: 0.45,
             atmo_thickness: 0.06,
@@ -108,6 +118,23 @@ impl RenderSettings {
             }
         }
         m
+    }
+
+    /// Coastline / border stroke widths in px, `0.0` when hidden (the thick-line
+    /// shader collapses a zero-width segment to nothing).
+    pub fn coast_width_px(&self) -> f32 {
+        if self.coast_visible {
+            self.coast_width
+        } else {
+            0.0
+        }
+    }
+    pub fn border_width_px(&self) -> f32 {
+        if self.border_visible {
+            self.border_width
+        } else {
+            0.0
+        }
     }
 }
 
@@ -181,6 +208,14 @@ pub struct UiState {
     pub selected: Option<usize>,
     /// Case-insensitive substring filter for the body list.
     pub filter: String,
+
+    // --- Random sampling of the loaded group ---
+    /// How many objects to show (random subset). 0 = no sampling control.
+    pub sample_count: usize,
+    /// Total objects available in the loaded group (slider upper bound).
+    pub sample_total: usize,
+    /// Set by the slider when the count changes; the app re-samples and clears it.
+    pub resample: bool,
 }
 
 impl UiState {
@@ -191,6 +226,9 @@ impl UiState {
             time_scale,
             selected: None,
             filter: String::new(),
+            sample_count: 0,
+            sample_total: 0,
+            resample: false,
         }
     }
 }
@@ -323,12 +361,26 @@ fn properties_panel(ctx: &Context, ui: &mut UiState, world: &World) {
             );
 
             let selected = ui.selected;
+            let sample_total = ui.sample_total;
+            let mut sample_count = ui.sample_count;
+            let mut request_resample = false;
             let s = &mut ui.settings;
             p.add_space(6.0);
 
             egui::CollapsingHeader::new("Satellites")
                 .default_open(true)
                 .show(p, |c| {
+                    if sample_total > 0 {
+                        let resp = c.add(
+                            egui::Slider::new(&mut sample_count, 1..=sample_total)
+                                .text(format!("shown / {sample_total}")),
+                        );
+                        // Re-sample on a committed change (release / click /
+                        // keyboard), not on every drag tick.
+                        if resp.drag_stopped() || (resp.changed() && !resp.dragged()) {
+                            request_resample = true;
+                        }
+                    }
                     c.add(egui::Slider::new(&mut s.marker_size, 0.25..=4.0).text("marker size"));
                     c.checkbox(&mut s.show_labels, "labels");
                     c.checkbox(&mut s.show_tracks, "orbit tracks");
@@ -366,6 +418,8 @@ fn properties_panel(ctx: &Context, ui: &mut UiState, world: &World) {
             egui::CollapsingHeader::new("Land")
                 .default_open(false)
                 .show(p, |c| {
+                    // Shared across both line layers (one brightness / far-side
+                    // alpha uniform drives coastlines and borders alike).
                     c.add(
                         egui::Slider::new(&mut s.line_brightness, 0.2..=2.0)
                             .text("line brightness"),
@@ -375,6 +429,27 @@ fn properties_panel(ctx: &Context, ui: &mut UiState, world: &World) {
                             .text("far-side lines"),
                     );
                     c.add(egui::Slider::new(&mut s.fill_alpha, 0.0..=1.0).text("land fill"));
+
+                    egui::CollapsingHeader::new("Coastlines")
+                        .id_salt("coastlines")
+                        .default_open(true)
+                        .show(c, |g| {
+                            g.checkbox(&mut s.coast_visible, "visible");
+                            g.add_enabled(
+                                s.coast_visible,
+                                egui::Slider::new(&mut s.coast_width, 0.5..=6.0).text("width px"),
+                            );
+                        });
+                    egui::CollapsingHeader::new("Borders")
+                        .id_salt("borders")
+                        .default_open(true)
+                        .show(c, |g| {
+                            g.checkbox(&mut s.border_visible, "visible");
+                            g.add_enabled(
+                                s.border_visible,
+                                egui::Slider::new(&mut s.border_width, 0.5..=6.0).text("width px"),
+                            );
+                        });
                 });
 
             egui::CollapsingHeader::new("Atmosphere")
@@ -398,6 +473,13 @@ fn properties_panel(ctx: &Context, ui: &mut UiState, world: &World) {
                 _ => {
                     p.weak("No body selected — pick one from the list.");
                 }
+            }
+
+            // Persist the sample slider (and flag a resample) now that the
+            // settings borrow is done.
+            ui.sample_count = sample_count;
+            if request_resample {
+                ui.resample = true;
             }
         });
 }
