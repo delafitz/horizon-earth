@@ -84,5 +84,5 @@ fn fs_ground(in: VOut) -> @location(0) vec4<f32> {
 
 @fragment
 fn fs_ground_back(in: VOut) -> @location(0) vec4<f32> {
-    return vec4<f32>(in.col, u.style2.y * 0.35);
+    return vec4<f32>(in.col, u.style2.y * u.style2.z);
 }

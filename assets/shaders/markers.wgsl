@@ -7,6 +7,9 @@ struct U {
     model: mat4x4<f32>,
     cam_pos: vec4<f32>,
     params: vec4<f32>, // params.x = viewport aspect (width / height)
+    style0: vec4<f32>,
+    style1: vec4<f32>,
+    style2: vec4<f32>, // z = far-side satellite-artifact alpha
 };
 @group(0) @binding(0) var<uniform> u: U;
 
@@ -83,7 +86,7 @@ fn fs_main(in: VOut) -> @location(0) vec4<f32> {
 // Far side (behind the translucent globe): dimmer, seen "through the glass".
 @fragment
 fn fs_back(in: VOut) -> @location(0) vec4<f32> {
-    let a = marker_alpha(in.uv, in.kind) * 0.4;
+    let a = marker_alpha(in.uv, in.kind) * u.style2.z;
     if (a < 0.02) {
         discard;
     }

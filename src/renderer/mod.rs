@@ -63,6 +63,10 @@ const ATTRS_THICK_INST: [wgpu::VertexAttribute; 3] =
 // from altitude); `RING_SEGMENTS` points per ring.
 const GROUND_WIDTH_PX: f32 = 1.5;
 const GROUND_ALPHA: f32 = 0.5;
+// Far-side (behind-globe) alpha multiplier shared by the satellite-related
+// layers — orbit tracks, markers and ground anchors — seen "through the glass".
+// Lives in style2.z so the egui panel can bind one transparency slider to it.
+const FAR_SAT_ALPHA: f32 = 0.4;
 const RING_SEGMENTS: usize = 48;
 // Surface radius for ground geometry: just above the globe and land fill.
 const GROUND_RADIUS: f32 = 1.0015;
@@ -92,7 +96,8 @@ struct Uniforms {
     // z = orbit-track alpha, w = line brightness
     style1: [f32; 4], // x = atmosphere intensity, y = atmosphere outer radius,
     // z = coastline width px, w = border width px
-    style2: [f32; 4], // x = ground-line width px, y = ground-line alpha
+    style2: [f32; 4], // x = ground-line width px, y = ground-line alpha,
+    // z = far-side alpha for satellite layers (tracks/markers/ground)
 }
 
 pub struct Renderer {
@@ -817,7 +822,7 @@ impl Renderer {
                 s.coast_width_px(),
                 s.border_width_px(),
             ],
-            style2: [GROUND_WIDTH_PX, GROUND_ALPHA, 0.0, 0.0],
+            style2: [GROUND_WIDTH_PX, GROUND_ALPHA, FAR_SAT_ALPHA, 0.0],
         };
         self.queue
             .write_buffer(&self.uniform_buf, 0, bytemuck::cast_slice(&[u]));
