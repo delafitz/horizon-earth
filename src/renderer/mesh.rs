@@ -11,13 +11,33 @@ pub struct VertexPN {
     pub nrm: [f32; 3],
 }
 
-/// Position + colour, used for coastline / border line segments.
+/// Position + colour, used for coastline / border / orbit-track line segments.
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable)]
 pub struct VertexPC {
     pub pos: [f32; 3],
     pub col: [f32; 3],
 }
+
+/// Per-instance data for an orbiting-body marker billboard.
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable)]
+pub struct MarkerInstance {
+    /// World-space centre in `.xyz`, billboard half-size (NDC) in `.w`.
+    pub center_size: [f32; 4],
+    pub color: [f32; 3],
+    pub _pad: f32,
+}
+
+/// Two-triangle unit quad in `[-1, 1]`, expanded per-instance in the shader.
+pub const MARKER_QUAD: [[f32; 2]; 6] = [
+    [-1.0, -1.0],
+    [1.0, -1.0],
+    [1.0, 1.0],
+    [-1.0, -1.0],
+    [1.0, 1.0],
+    [-1.0, 1.0],
+];
 
 /// Build a UV sphere. `stacks` are latitude bands, `sectors` are longitude
 /// divisions. Returns vertices (position + outward normal) and triangle
@@ -46,7 +66,16 @@ pub fn uv_sphere(stacks: u32, sectors: u32, radius: f32) -> (Vec<VertexPN>, Vec<
         for j in 0..sectors {
             let a = i * cols + j;
             let b = a + cols;
-            indices.extend_from_slice(&[a, b, a + 1, a + 1, b, b + 1]);
+            // At the poles the cap row collapses to a single point, so one of
+            // the two triangles per quad is degenerate (zero-area). Emitting
+            // those produces thin sliver streaks radiating from the pole, so
+            // skip them and let each cap be a clean triangle fan.
+            if i != 0 {
+                indices.extend_from_slice(&[a, b, a + 1]);
+            }
+            if i != stacks - 1 {
+                indices.extend_from_slice(&[a + 1, b, b + 1]);
+            }
         }
     }
 

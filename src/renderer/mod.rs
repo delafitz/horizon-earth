@@ -5,11 +5,13 @@ pub mod mesh;
 use std::sync::Arc;
 
 use bytemuck::{Pod, Zeroable};
-use glam::{Mat4, Vec3};
+use glam::Mat4;
 use wgpu::util::DeviceExt;
 use winit::window::Window;
 
-use mesh::{VertexPC, VertexPN};
+use crate::camera::OrbitCamera;
+use crate::orbit::Orbit;
+use mesh::{MarkerInstance, VertexPC, VertexPN};
 
 // Natural Earth vector data, embedded so the binary is self-contained.
 const COASTLINE_GEOJSON: &str = include_str!("../../assets/earth/ne_110m_coastline.geojson");
@@ -33,6 +35,12 @@ const ATTRS_PN: [wgpu::VertexAttribute; 2] =
 const ATTRS_PC: [wgpu::VertexAttribute; 2] =
     wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3];
 const ATTRS_POS: [wgpu::VertexAttribute; 1] = wgpu::vertex_attr_array![0 => Float32x3];
+const ATTRS_CORNER: [wgpu::VertexAttribute; 1] = wgpu::vertex_attr_array![0 => Float32x2];
+const ATTRS_MARKER_INST: [wgpu::VertexAttribute; 2] =
+    wgpu::vertex_attr_array![1 => Float32x4, 2 => Float32x3];
+
+// On-screen half-size of a body marker, in NDC units.
+const MARKER_SIZE: f32 = 0.02;
 
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable)]
@@ -40,6 +48,7 @@ struct Uniforms {
     view_proj: [[f32; 4]; 4],
     model: [[f32; 4]; 4],
     cam_pos: [f32; 4],
+    params: [f32; 4], // params.x = viewport aspect
 }
 
 pub struct Renderer {
@@ -55,8 +64,11 @@ pub struct Renderer {
 
     starfield_pipeline: wgpu::RenderPipeline,
     globe_pipeline: wgpu::RenderPipeline,
+    lines_back_pipeline: wgpu::RenderPipeline,
     lines_pipeline: wgpu::RenderPipeline,
     atmosphere_pipeline: wgpu::RenderPipeline,
+    track_pipeline: wgpu::RenderPipeline,
+    markers_pipeline: wgpu::RenderPipeline,
 
     sphere_vbuf: wgpu::Buffer,
     sphere_ibuf: wgpu::Buffer,
@@ -64,6 +76,15 @@ pub struct Renderer {
 
     line_vbuf: wgpu::Buffer,
     line_vcount: u32,
+
+    track_vbuf: wgpu::Buffer,
+    track_vcount: u32,
+
+    marker_quad_vbuf: wgpu::Buffer,
+    marker_inst_buf: wgpu::Buffer,
+
+    camera: OrbitCamera,
+    bodies: Vec<Orbit>,
 }
 
 impl Renderer {
@@ -173,6 +194,8 @@ impl Renderer {
         let globe_sh = shader(&device, "globe", include_str!("../../assets/shaders/globe.wgsl"));
         let lines_sh = shader(&device, "lines", include_str!("../../assets/shaders/lines.wgsl"));
         let atmo_sh = shader(&device, "atmosphere", include_str!("../../assets/shaders/atmosphere.wgsl"));
+        let track_sh = shader(&device, "track", include_str!("../../assets/shaders/track.wgsl"));
+        let markers_sh = shader(&device, "markers", include_str!("../../assets/shaders/markers.wgsl"));
 
         let pn_layout = wgpu::VertexBufferLayout {
             array_stride: std::mem::size_of::<VertexPN>() as u64,
@@ -188,6 +211,21 @@ impl Renderer {
             array_stride: std::mem::size_of::<VertexPN>() as u64,
             step_mode: wgpu::VertexStepMode::Vertex,
             attributes: &ATTRS_POS,
+        };
+        let track_layout = wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<VertexPC>() as u64,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &ATTRS_PC,
+        };
+        let corner_layout = wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<[f32; 2]>() as u64,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &ATTRS_CORNER,
+        };
+        let inst_layout = wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<MarkerInstance>() as u64,
+            step_mode: wgpu::VertexStepMode::Instance,
+            attributes: &ATTRS_MARKER_INST,
         };
 
         let additive = wgpu::BlendState {
@@ -206,22 +244,45 @@ impl Renderer {
         let starfield_pipeline = make_pipeline(
             &device, &pipeline_layout, &starfield_sh, format, &[],
             wgpu::PrimitiveTopology::TriangleList, None, false,
-            wgpu::CompareFunction::Always,
+            wgpu::CompareFunction::Always, "fs_main",
         );
         let globe_pipeline = make_pipeline(
             &device, &pipeline_layout, &globe_sh, format, &[pn_layout],
-            wgpu::PrimitiveTopology::TriangleList, None, true,
-            wgpu::CompareFunction::Less,
+            wgpu::PrimitiveTopology::TriangleList,
+            Some(wgpu::BlendState::ALPHA_BLENDING), true,
+            wgpu::CompareFunction::Less, "fs_main",
+        );
+        // Far-hemisphere lines: only where they sit behind the globe surface
+        // (depth Greater), faint and non-depth-writing.
+        let lines_back_pipeline = make_pipeline(
+            &device, &pipeline_layout, &lines_sh, format, &[pc_layout.clone()],
+            wgpu::PrimitiveTopology::LineList,
+            Some(wgpu::BlendState::ALPHA_BLENDING), false,
+            wgpu::CompareFunction::Greater, "fs_back",
         );
         let lines_pipeline = make_pipeline(
             &device, &pipeline_layout, &lines_sh, format, &[pc_layout],
             wgpu::PrimitiveTopology::LineList, None, true,
-            wgpu::CompareFunction::LessEqual,
+            wgpu::CompareFunction::LessEqual, "fs_main",
         );
         let atmosphere_pipeline = make_pipeline(
             &device, &pipeline_layout, &atmo_sh, format, &[pos_layout],
             wgpu::PrimitiveTopology::TriangleList, Some(additive), false,
-            wgpu::CompareFunction::LessEqual,
+            wgpu::CompareFunction::LessEqual, "fs_main",
+        );
+        // Orbit tracks: inertial-frame line loops, faint and non-depth-writing.
+        let track_pipeline = make_pipeline(
+            &device, &pipeline_layout, &track_sh, format, &[track_layout],
+            wgpu::PrimitiveTopology::LineList,
+            Some(wgpu::BlendState::ALPHA_BLENDING), false,
+            wgpu::CompareFunction::LessEqual, "fs_main",
+        );
+        // Body markers: instanced billboards (quad buffer + instance buffer).
+        let markers_pipeline = make_pipeline(
+            &device, &pipeline_layout, &markers_sh, format, &[corner_layout, inst_layout],
+            wgpu::PrimitiveTopology::TriangleList,
+            Some(wgpu::BlendState::ALPHA_BLENDING), false,
+            wgpu::CompareFunction::LessEqual, "fs_main",
         );
 
         // --- Geometry --------------------------------------------------------
@@ -258,6 +319,40 @@ impl Renderer {
         });
         let line_vcount = line_verts.len() as u32;
 
+        // --- Orbiting bodies -------------------------------------------------
+        let camera = OrbitCamera::default();
+        let bodies = crate::orbit::demo_bodies();
+
+        // Static orbit paths (the body slides along them each frame).
+        let mut track_verts: Vec<VertexPC> = Vec::new();
+        for body in &bodies {
+            let col = [body.color[0] * 0.85, body.color[1] * 0.85, body.color[2] * 0.85];
+            let pts = body.track(128);
+            for w in pts.windows(2) {
+                track_verts.push(VertexPC { pos: w[0].to_array(), col });
+                track_verts.push(VertexPC { pos: w[1].to_array(), col });
+            }
+        }
+        let track_vbuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("track-verts"),
+            contents: bytemuck::cast_slice(&track_verts),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+        let track_vcount = track_verts.len() as u32;
+
+        let marker_quad_vbuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("marker-quad"),
+            contents: bytemuck::cast_slice(&mesh::MARKER_QUAD),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+        // Filled each frame in `update`; one MarkerInstance per body.
+        let marker_inst_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("marker-instances"),
+            size: (bodies.len().max(1) * std::mem::size_of::<MarkerInstance>()) as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
         Renderer {
             surface,
             device,
@@ -268,13 +363,22 @@ impl Renderer {
             bind_group,
             starfield_pipeline,
             globe_pipeline,
+            lines_back_pipeline,
             lines_pipeline,
             atmosphere_pipeline,
+            track_pipeline,
+            markers_pipeline,
             sphere_vbuf,
             sphere_ibuf,
             sphere_icount,
             line_vbuf,
             line_vcount,
+            track_vbuf,
+            track_vcount,
+            marker_quad_vbuf,
+            marker_inst_buf,
+            camera,
+            bodies,
         }
     }
 
@@ -288,21 +392,50 @@ impl Renderer {
         self.depth_view = create_depth_view(&self.device, &self.config);
     }
 
-    /// Update camera + model transform for the given elapsed time (seconds).
+    /// Orbit the camera by pixel-scaled yaw/pitch deltas.
+    pub fn orbit_camera(&mut self, dyaw: f32, dpitch: f32) {
+        self.camera.orbit(dyaw, dpitch);
+    }
+
+    /// Dolly the camera in (positive) or out (negative).
+    pub fn zoom_camera(&mut self, factor: f32) {
+        self.camera.zoom(factor);
+    }
+
+    /// Update camera + model transform and body positions for the given
+    /// elapsed time (seconds).
     pub fn update(&mut self, time: f32) {
         let aspect = self.config.width as f32 / self.config.height.max(1) as f32;
-        let proj = Mat4::perspective_rh(45f32.to_radians(), aspect, 0.1, 100.0);
-        let eye = Vec3::new(0.0, 0.7, 2.7);
-        let view = Mat4::look_at_rh(eye, Vec3::ZERO, Vec3::Y);
+        let view_proj = self.camera.view_proj(aspect);
+        let eye = self.camera.eye();
+        // The globe spins on its axis; orbiting bodies stay in the inertial
+        // frame, so they are not multiplied by this model matrix.
         let model = Mat4::from_rotation_y(time * 0.12);
 
         let u = Uniforms {
-            view_proj: (proj * view).to_cols_array_2d(),
+            view_proj: view_proj.to_cols_array_2d(),
             model: model.to_cols_array_2d(),
             cam_pos: [eye.x, eye.y, eye.z, 1.0],
+            params: [aspect, 0.0, 0.0, 0.0],
         };
         self.queue
             .write_buffer(&self.uniform_buf, 0, bytemuck::cast_slice(&[u]));
+
+        // Refresh marker instances from the current orbit positions.
+        let instances: Vec<MarkerInstance> = self
+            .bodies
+            .iter()
+            .map(|b| {
+                let p = b.position(time);
+                MarkerInstance {
+                    center_size: [p.x, p.y, p.z, MARKER_SIZE],
+                    color: b.color,
+                    _pad: 0.0,
+                }
+            })
+            .collect();
+        self.queue
+            .write_buffer(&self.marker_inst_buf, 0, bytemuck::cast_slice(&instances));
     }
 
     pub fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
@@ -349,16 +482,38 @@ impl Renderer {
             rp.set_index_buffer(self.sphere_ibuf.slice(..), wgpu::IndexFormat::Uint32);
             rp.draw_indexed(0..self.sphere_icount, 0, 0..1);
 
-            // Coastlines + borders.
+            // Far-side coastlines + borders, faint (behind the globe surface).
+            rp.set_pipeline(&self.lines_back_pipeline);
+            rp.set_vertex_buffer(0, self.line_vbuf.slice(..));
+            rp.draw(0..self.line_vcount, 0..1);
+
+            // Near-side coastlines + borders.
             rp.set_pipeline(&self.lines_pipeline);
             rp.set_vertex_buffer(0, self.line_vbuf.slice(..));
             rp.draw(0..self.line_vcount, 0..1);
+
+            // Orbit tracks (inertial frame).
+            if self.track_vcount > 0 {
+                rp.set_pipeline(&self.track_pipeline);
+                rp.set_vertex_buffer(0, self.track_vbuf.slice(..));
+                rp.draw(0..self.track_vcount, 0..1);
+            }
 
             // Atmospheric glow.
             rp.set_pipeline(&self.atmosphere_pipeline);
             rp.set_vertex_buffer(0, self.sphere_vbuf.slice(..));
             rp.set_index_buffer(self.sphere_ibuf.slice(..), wgpu::IndexFormat::Uint32);
             rp.draw_indexed(0..self.sphere_icount, 0, 0..1);
+
+            // Orbiting bodies (instanced billboards), drawn last so they read
+            // crisply; still depth-tested so bodies behind the globe are hidden.
+            let body_count = self.bodies.len() as u32;
+            if body_count > 0 {
+                rp.set_pipeline(&self.markers_pipeline);
+                rp.set_vertex_buffer(0, self.marker_quad_vbuf.slice(..));
+                rp.set_vertex_buffer(1, self.marker_inst_buf.slice(..));
+                rp.draw(0..6, 0..body_count);
+            }
         }
 
         self.queue.submit(Some(enc.finish()));
@@ -406,6 +561,7 @@ fn make_pipeline(
     blend: Option<wgpu::BlendState>,
     depth_write: bool,
     depth_compare: wgpu::CompareFunction,
+    fs_entry: &str,
 ) -> wgpu::RenderPipeline {
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: None,
@@ -435,7 +591,7 @@ fn make_pipeline(
         multisample: wgpu::MultisampleState::default(),
         fragment: Some(wgpu::FragmentState {
             module: shader,
-            entry_point: "fs_main",
+            entry_point: fs_entry,
             compilation_options: wgpu::PipelineCompilationOptions::default(),
             targets: &[Some(wgpu::ColorTargetState {
                 format,

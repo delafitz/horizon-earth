@@ -26,3 +26,10 @@ fn vs_main(@location(0) pos: vec3<f32>, @location(1) col: vec3<f32>) -> VOut {
 fn fs_main(in: VOut) -> @location(0) vec4<f32> {
     return vec4<f32>(in.col, 1.0);
 }
+
+// Far-hemisphere variant: faint, alpha-blended so the back of the globe's
+// coastlines/borders read in darker contrast through the translucent surface.
+@fragment
+fn fs_back(in: VOut) -> @location(0) vec4<f32> {
+    return vec4<f32>(in.col, 0.28);
+}

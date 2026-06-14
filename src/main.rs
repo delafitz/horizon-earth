@@ -6,19 +6,74 @@
 //! screensaver.
 
 mod app;
+mod camera;
 mod data;
 mod earth;
+mod orbit;
 mod renderer;
 
 use winit::event_loop::{ControlFlow, EventLoop};
 
+const USAGE: &str = "\
+Horizon Earth — a Nord-themed 3D Earth visualization.
+
+Usage: horizon [OPTIONS]
+
+Options:
+  -w, --windowed   Run in a 1280x800 window instead of fullscreen
+  -n, --no-exit    Don't quit on input (enables orbit camera; Escape still quits)
+  -v, --verbose    Verbose logging (equivalent to RUST_LOG=info)
+  -h, --help       Print this help
+
+Each flag has an equivalent environment variable:
+  HORIZON_WINDOWED=1, HORIZON_NO_EXIT=1, RUST_LOG=info
+";
+
+/// Runtime options, resolved from environment variables and command-line
+/// flags. A flag and its env var are equivalent; either one enables the option.
+struct Options {
+    windowed: bool,
+    no_exit: bool,
+    verbose: bool,
+}
+
+impl Options {
+    fn resolve() -> Options {
+        let mut o = Options {
+            windowed: std::env::var_os("HORIZON_WINDOWED").is_some(),
+            no_exit: std::env::var_os("HORIZON_NO_EXIT").is_some(),
+            verbose: false,
+        };
+        for arg in std::env::args().skip(1) {
+            match arg.as_str() {
+                "-w" | "--windowed" => o.windowed = true,
+                "-n" | "--no-exit" => o.no_exit = true,
+                "-v" | "--verbose" => o.verbose = true,
+                "-h" | "--help" => {
+                    print!("{USAGE}");
+                    std::process::exit(0);
+                }
+                other => {
+                    eprint!("horizon: unrecognized argument '{other}'\n\n{USAGE}");
+                    std::process::exit(2);
+                }
+            }
+        }
+        o
+    }
+}
+
 fn main() {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
+    let opts = Options::resolve();
+
+    // `RUST_LOG` still wins if set; otherwise --verbose picks the default level.
+    let default_level = if opts.verbose { "info" } else { "warn" };
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(default_level)).init();
 
     let event_loop = EventLoop::new().expect("failed to create event loop");
     // Poll continuously so the globe animates every frame.
     event_loop.set_control_flow(ControlFlow::Poll);
 
-    let mut app = app::App::new();
+    let mut app = app::App::new(opts.windowed, opts.no_exit);
     event_loop.run_app(&mut app).expect("event loop error");
 }

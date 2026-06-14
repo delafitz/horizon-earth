@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use winit::application::ApplicationHandler;
-use winit::event::{ElementState, WindowEvent};
+use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::ActiveEventLoop;
 use winit::keyboard::{Key, NamedKey};
 use winit::window::{Fullscreen, Window, WindowId};
@@ -21,19 +21,21 @@ pub struct App {
     renderer: Option<Renderer>,
     start: Instant,
     last_cursor: Option<(f64, f64)>,
+    dragging: bool,
     no_exit: bool,
     windowed: bool,
 }
 
 impl App {
-    pub fn new() -> Self {
+    pub fn new(windowed: bool, no_exit: bool) -> Self {
         Self {
             window: None,
             renderer: None,
             start: Instant::now(),
             last_cursor: None,
-            no_exit: std::env::var_os("HORIZON_NO_EXIT").is_some(),
-            windowed: std::env::var_os("HORIZON_WINDOWED").is_some(),
+            dragging: false,
+            no_exit,
+            windowed,
         }
     }
 }
@@ -85,24 +87,51 @@ impl ApplicationHandler for App {
                 }
             }
 
-            WindowEvent::MouseInput { state, .. } => {
-                if state == ElementState::Pressed && !self.no_exit {
+            // Interactive (HORIZON_NO_EXIT): left-drag orbits the camera.
+            // Screensaver: any press is "activity" and quits.
+            WindowEvent::MouseInput { state, button, .. } => {
+                if self.no_exit {
+                    if button == MouseButton::Left {
+                        self.dragging = state == ElementState::Pressed;
+                    }
+                } else if state == ElementState::Pressed {
+                    event_loop.exit();
+                }
+            }
+
+            WindowEvent::MouseWheel { delta, .. } => {
+                if self.no_exit {
+                    let y = match delta {
+                        MouseScrollDelta::LineDelta(_, y) => y,
+                        MouseScrollDelta::PixelDelta(p) => p.y as f32 / 50.0,
+                    };
+                    if let Some(r) = self.renderer.as_mut() {
+                        r.zoom_camera(y * 0.1); // scroll up = zoom in
+                    }
+                } else {
                     event_loop.exit();
                 }
             }
 
             WindowEvent::CursorMoved { position, .. } => {
                 let pos = (position.x, position.y);
-                match self.last_cursor {
-                    // First report establishes a baseline (avoids quitting on
-                    // the cursor's initial placement).
-                    None => self.last_cursor = Some(pos),
-                    Some((x, y)) => {
-                        let moved = ((pos.0 - x).powi(2) + (pos.1 - y).powi(2)).sqrt();
-                        if moved > 6.0 && !self.no_exit {
-                            event_loop.exit();
+                let prev = self.last_cursor.replace(pos);
+                let Some((x, y)) = prev else {
+                    // First report just establishes a baseline.
+                    return;
+                };
+                let (dx, dy) = ((pos.0 - x) as f32, (pos.1 - y) as f32);
+
+                if self.no_exit {
+                    if self.dragging {
+                        if let Some(r) = self.renderer.as_mut() {
+                            // Pixels -> radians; drag grabs and turns the globe.
+                            const S: f32 = 0.005;
+                            r.orbit_camera(-dx * S, dy * S);
                         }
                     }
+                } else if (dx * dx + dy * dy).sqrt() > 6.0 {
+                    event_loop.exit();
                 }
             }
 

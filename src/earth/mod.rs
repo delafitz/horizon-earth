@@ -12,10 +12,12 @@ use crate::renderer::mesh::VertexPC;
 ///   y = r * sin(lat)
 ///   z = r * cos(lat) * sin(lon)
 ///
-/// North pole at +Y, longitude 0 at +X.
+/// North pole at +Y, longitude 0 at +X. Longitude is negated so the globe
+/// reads correctly when viewed from outside (east to the right as a meridian
+/// faces the camera); without this the continents come out mirrored.
 pub fn latlon_to_xyz(lon_deg: f64, lat_deg: f64, radius: f32) -> [f32; 3] {
     let lat = lat_deg.to_radians();
-    let lon = lon_deg.to_radians();
+    let lon = (-lon_deg).to_radians();
     let cl = lat.cos();
     let x = radius as f64 * cl * lon.cos();
     let y = radius as f64 * lat.sin();

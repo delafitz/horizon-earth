@@ -47,15 +47,22 @@ cargo run --release
 
 Runs fullscreen borderless and exits on any keyboard or mouse activity.
 
-### Development env vars
+### Options
 
-| Variable             | Effect |
-|----------------------|--------|
-| `HORIZON_WINDOWED=1` | Run in a 1280×800 window instead of fullscreen |
-| `HORIZON_NO_EXIT=1`  | Don't quit on input (Escape still quits) |
-| `RUST_LOG=info`      | Verbose logging (default is `warn`) |
+Each flag has an equivalent environment variable; either one enables it
+(`horizon --help` lists them).
+
+| Flag              | Env var               | Effect |
+|-------------------|-----------------------|--------|
+| `-w, --windowed`  | `HORIZON_WINDOWED=1`  | Run in a 1280×800 window instead of fullscreen |
+| `-n, --no-exit`   | `HORIZON_NO_EXIT=1`   | Don't quit on input — enables the orbit camera (Escape still quits) |
+| `-v, --verbose`   | `RUST_LOG=info`       | Verbose logging (default is `warn`) |
+
+In interactive mode (`--no-exit`), left-drag orbits the camera and scroll zooms.
 
 ```sh
+cargo run -- --windowed --no-exit
+# or, equivalently:
 HORIZON_WINDOWED=1 HORIZON_NO_EXIT=1 cargo run
 ```
 
@@ -63,15 +70,17 @@ HORIZON_WINDOWED=1 HORIZON_NO_EXIT=1 cargo run
 
 ```
 src/
-  main.rs            entry point + event loop setup
-  app.rs             winit ApplicationHandler: window, input, exit-on-activity
+  main.rs            entry point, CLI/env options, event loop setup
+  app.rs             winit ApplicationHandler: window, input, camera control
+  camera.rs          orbit (arcball) camera: target/distance/yaw/pitch -> view
+  orbit.rs           orbiting bodies: circular-orbit model + demo satellites
   data/              minimal GeoJSON coordinate reader
   earth/             lat/lon -> sphere projection, line-segment building
   renderer/          wgpu surface, pipelines, per-frame draw
-    mesh.rs          vertex types + UV sphere generation
+    mesh.rs          vertex types, UV sphere, marker quad/instance
 assets/
   earth/             Natural Earth GeoJSON (embedded at build time)
-  shaders/           WGSL: starfield, globe, lines, atmosphere
+  shaders/           WGSL: starfield, globe, lines, track, markers, atmosphere
 cache/               runtime caches (later phases)
 ```
 
@@ -84,6 +93,71 @@ cache/               runtime caches (later phases)
 | Country borders | `#4C566A` (Nord3) |
 | Coastlines   | `#88C0D0` (Nord8)   |
 | Atmosphere   | `#81A1C1` (Nord9)   |
+
+## Tuning knobs
+
+Most of the look and feel is controlled by a handful of named values. Shader
+values (`assets/shaders/*.wgsl`) are embedded via `include_str!`, so editing a
+shader just needs a rebuild. Knobs are referenced by file + constant/expression
+rather than line number (line numbers drift).
+
+### Atmosphere — `assets/shaders/atmosphere.wgsl`
+
+The glow is driven by the view ray's closest approach to the globe centre (the
+"impact parameter" `b`), so it stays anchored as the camera orbits/zooms.
+
+| Knob | Effect |
+|------|--------|
+| `OUTER` (const) | Atmosphere outer reach; also the shell scale. Larger = taller halo. |
+| `0.985` in `inner = smoothstep(0.985, SURFACE, b)` | How far the glow bleeds under the surface. Closer to `1.0` = less under-surface glow. |
+| `fade = 1.0 - smoothstep(SURFACE, OUTER, b)` | Outward falloff to transparent at the outer edge. |
+| `* 0.45` | Overall glow intensity. |
+
+### Globe — `assets/shaders/globe.wgsl`
+
+| Knob | Effect |
+|------|--------|
+| alpha `0.45` in the returned colour | Surface transparency. |
+| `0.30 + 0.70 * d` | Ambient / diffuse lighting balance. |
+| `base` colour | Globe fill (Nord1). |
+
+### Coastlines & borders
+
+| Knob | Where | Effect |
+|------|-------|--------|
+| `COLOR_COAST`, `COLOR_BORDER` | `src/renderer/mod.rs` | Line colours. |
+| `1.0020` / `1.0030` in `build_lines(...)` | `src/renderer/mod.rs` | Border / coastline height above the surface (coastlines win overlaps). |
+| alpha `0.28` in `fs_back` | `assets/shaders/lines.wgsl` | Faintness of far-side (behind-globe) lines. |
+
+### Orbiting bodies & tracks
+
+| Knob | Where | Effect |
+|------|-------|--------|
+| `demo_bodies()` entries | `src/orbit.rs` | Per body: `radius` (altitude), `inclination`, `raan`, `period` (speed), `phase0`, `color`. |
+| `MARKER_SIZE` | `src/renderer/mod.rs` | On-screen marker size (NDC). |
+| `body.track(128)` | `src/renderer/mod.rs` | Orbit-track smoothness (segment count). |
+| alpha `0.35` in `fs_main` | `assets/shaders/track.wgsl` | Orbit-track faintness. |
+| `smoothstep` / `core` | `assets/shaders/markers.wgsl` | Marker dot softness and core brightness. |
+
+### Camera & input
+
+| Knob | Where | Effect |
+|------|-------|--------|
+| `DIST_MIN` / `DIST_MAX` | `src/camera.rs` | Zoom limits. |
+| `PITCH_LIMIT` | `src/camera.rs` | How close to the poles you can tilt. |
+| `fov_y`, default `distance` / `pitch` | `src/camera.rs` | Field of view and starting view. |
+| `const S` in `CursorMoved` | `src/app.rs` | Drag orbit sensitivity. |
+| `y * 0.1` in `MouseWheel` | `src/app.rs` | Zoom step per scroll. |
+| `> 6.0` in `CursorMoved` | `src/app.rs` | Screensaver "activity" threshold (px). |
+
+### Scene
+
+| Knob | Where | Effect |
+|------|-------|--------|
+| `time * 0.12` in `update` | `src/renderer/mod.rs` | Globe axial spin speed. |
+| `uv_sphere(64, 96, 1.0)` | `src/renderer/mod.rs` | Sphere tessellation (stacks, sectors). |
+| `COLOR_BG` | `src/renderer/mod.rs` | Background colour. |
+| `80.0` grid / `0.90` threshold | `assets/shaders/starfield.wgsl` | Star density and sparsity. |
 
 ## Data attribution
 

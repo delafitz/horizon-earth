@@ -29,5 +29,5 @@ fn fs_main(in: VOut) -> @location(0) vec4<f32> {
     let d = max(dot(N, L), 0.0);
     let base = vec3<f32>(0.231, 0.259, 0.322); // Nord1 #3B4252
     let col = base * (0.30 + 0.70 * d);
-    return vec4<f32>(col, 1.0);
+    return vec4<f32>(col, 0.45);
 }
