@@ -82,6 +82,22 @@ impl World {
     pub fn body_position_eci(&self, i: usize) -> DVec3 {
         self.bodies[i].motion.position_eci(self.current)
     }
+
+    /// Sub-satellite geographic point of body `i` as `(lat_deg, lon_deg)`,
+    /// latitude in [-90, 90] and longitude in [-180, 180]. Derotates the ECI
+    /// position into the Earth-fixed (ECEF) frame by GMST, then reads off the
+    /// spherical latitude/longitude.
+    pub fn body_latlon(&self, i: usize) -> (f64, f64) {
+        let p = self.body_position_eci(i);
+        let g = self.earth_rotation();
+        // ECEF = Rz(-g) * ECI.
+        let (s, c) = g.sin_cos();
+        let x = p.x * c + p.y * s;
+        let y = -p.x * s + p.y * c;
+        let lat = (p.z / p.length()).asin().to_degrees();
+        let lon = y.atan2(x).to_degrees();
+        (lat, lon)
+    }
 }
 
 /// Build bodies from real TLE/OMM element sets, propagated with SGP4. Element

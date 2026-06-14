@@ -29,3 +29,110 @@ pub fn build_lines(lines: &[PolyLine], color: [f32; 3], radius: f32, out: &mut V
         }
     }
 }
+
+/// Triangulate each closed ring and append the triangles to `out` (TriangleList
+/// topology: three vertices per triangle), projected onto the sphere. Used to
+/// give land a faint translucent body. Rings are triangulated in lon/lat space
+/// by ear clipping; at 110m resolution the per-triangle spherical distortion is
+/// negligible.
+pub fn build_fill(rings: &[PolyLine], color: [f32; 3], radius: f32, out: &mut Vec<VertexPC>) {
+    for ring in rings {
+        for v in triangulate(ring) {
+            out.push(VertexPC { pos: latlon_to_xyz(v[0], v[1], radius), col: color });
+        }
+    }
+}
+
+/// Ear-clipping triangulation of a simple polygon ring (lon/lat). Returns a flat
+/// list of triangle vertices (three per triangle). Holes are not handled.
+fn triangulate(ring: &[[f64; 2]]) -> Vec<[f64; 2]> {
+    let mut pts = ring.to_vec();
+    // Drop the GeoJSON closing vertex (first == last).
+    if pts.len() >= 2 && pts[0] == pts[pts.len() - 1] {
+        pts.pop();
+    }
+    let n = pts.len();
+    if n < 3 {
+        return Vec::new();
+    }
+
+    let mut idx: Vec<usize> = (0..n).collect();
+    // Ear test below assumes counter-clockwise winding.
+    if signed_area(&pts) < 0.0 {
+        idx.reverse();
+    }
+
+    let mut out = Vec::new();
+    // Each successful clip removes one vertex; `guard` backstops degenerate rings.
+    let mut guard = n * n;
+    while idx.len() > 3 && guard > 0 {
+        guard -= 1;
+        let m = idx.len();
+        let mut clipped = false;
+        for i in 0..m {
+            let ip = (i + m - 1) % m;
+            let inx = (i + 1) % m;
+            let a = pts[idx[ip]];
+            let b = pts[idx[i]];
+            let c = pts[idx[inx]];
+            if cross(a, b, c) <= 0.0 {
+                continue; // reflex vertex — not an ear tip
+            }
+            // No other vertex may lie inside the candidate ear triangle.
+            let mut ear = true;
+            for (k, &v) in idx.iter().enumerate() {
+                if k == ip || k == i || k == inx {
+                    continue;
+                }
+                if point_in_tri(pts[v], a, b, c) {
+                    ear = false;
+                    break;
+                }
+            }
+            if !ear {
+                continue;
+            }
+            out.push(a);
+            out.push(b);
+            out.push(c);
+            idx.remove(i);
+            clipped = true;
+            break;
+        }
+        if !clipped {
+            break; // self-intersecting / degenerate: stop early
+        }
+    }
+    if idx.len() == 3 {
+        out.push(pts[idx[0]]);
+        out.push(pts[idx[1]]);
+        out.push(pts[idx[2]]);
+    }
+    out
+}
+
+/// Twice the signed area of a polygon (positive = counter-clockwise).
+fn signed_area(p: &[[f64; 2]]) -> f64 {
+    let n = p.len();
+    let mut a = 0.0;
+    for i in 0..n {
+        let j = (i + 1) % n;
+        a += p[i][0] * p[j][1] - p[j][0] * p[i][1];
+    }
+    a
+}
+
+/// Z-component of (b-a) × (c-a); > 0 when a→b→c turns left.
+fn cross(a: [f64; 2], b: [f64; 2], c: [f64; 2]) -> f64 {
+    (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
+}
+
+/// True if `p` lies inside or on triangle `a,b,c` (any winding).
+fn point_in_tri(p: [f64; 2], a: [f64; 2], b: [f64; 2], c: [f64; 2]) -> bool {
+    let d1 = cross(a, b, p);
+    let d2 = cross(b, c, p);
+    let d3 = cross(c, a, p);
+    let has_neg = d1 < 0.0 || d2 < 0.0 || d3 < 0.0;
+    let has_pos = d1 > 0.0 || d2 > 0.0 || d3 > 0.0;
+    !(has_neg && has_pos)
+}

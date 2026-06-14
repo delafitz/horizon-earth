@@ -26,6 +26,7 @@ const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 // Nord palette (linear-ish RGB, written directly to a non-sRGB target).
 const COLOR_COAST: [f32; 3] = [0.533, 0.753, 0.816]; // Nord8 #88C0D0
 const COLOR_BORDER: [f32; 3] = [0.298, 0.337, 0.416]; // Nord3 #4C566A
+const COLOR_LAND: [f32; 3] = [0.263, 0.298, 0.369]; // Nord3-ish land fill (low alpha)
 const COLOR_BG: wgpu::Color = wgpu::Color {
     r: 0.180,
     g: 0.204,
@@ -44,13 +45,13 @@ const ATTRS_MARKER_INST: [wgpu::VertexAttribute; 2] =
     wgpu::vertex_attr_array![1 => Float32x4, 2 => Float32x4];
 
 // On-screen half-size of a body marker, in NDC units.
-const MARKER_SIZE: f32 = 0.02;
+const MARKER_SIZE: f32 = 0.01;
 
 // Vector label line vertex: NDC position + colour.
 const ATTRS_LABEL: [wgpu::VertexAttribute; 2] =
     wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x3];
 // Glyph cell height (px) and the per-frame line-vertex cap.
-const LABEL_PX: f32 = 11.0;
+const LABEL_PX: f32 = 24.0;
 const MAX_LABEL_VERTS: usize = 16384;
 
 #[repr(C)]
@@ -75,6 +76,7 @@ pub struct Renderer {
 
     starfield_pipeline: wgpu::RenderPipeline,
     globe_pipeline: wgpu::RenderPipeline,
+    fill_pipeline: wgpu::RenderPipeline,
     lines_back_pipeline: wgpu::RenderPipeline,
     lines_pipeline: wgpu::RenderPipeline,
     atmosphere_pipeline: wgpu::RenderPipeline,
@@ -92,6 +94,9 @@ pub struct Renderer {
 
     line_vbuf: wgpu::Buffer,
     line_vcount: u32,
+
+    fill_vbuf: wgpu::Buffer,
+    fill_vcount: u32,
 
     track_vbuf: wgpu::Buffer,
     track_vcount: u32,
@@ -268,6 +273,45 @@ impl Renderer {
             Some(wgpu::BlendState::ALPHA_BLENDING), true,
             wgpu::CompareFunction::Less, "fs_main",
         );
+        // Translucent land fill: closed country rings as triangles. Depth test
+        // disabled (compare Always, no write) so the flat triangles' sagging
+        // interiors aren't clipped by the globe; the shader discards the far
+        // hemisphere per fragment instead. Its own dedicated vs/fs entries pass
+        // world position through for that test.
+        let fill_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("land-fill"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &lines_sh,
+                entry_point: "vs_fill",
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                buffers: &[pc_layout.clone()],
+            },
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: false,
+                depth_compare: wgpu::CompareFunction::Always,
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &lines_sh,
+                entry_point: "fs_fill",
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            multiview: None,
+            cache: None,
+        });
         // Far-hemisphere lines: only where they sit behind the globe surface
         // (depth Greater), faint and non-depth-writing.
         let lines_back_pipeline = make_pipeline(
@@ -405,6 +449,19 @@ impl Renderer {
         });
         let line_vcount = line_verts.len() as u32;
 
+        // Translucent land fill from the closed country rings, sitting just above
+        // the globe surface and below the borders/coastlines.
+        let rings = crate::data::extract_polygon_rings(COUNTRIES_GEOJSON);
+        let mut fill_verts: Vec<VertexPC> = Vec::new();
+        crate::earth::build_fill(&rings, COLOR_LAND, 1.0010, &mut fill_verts);
+        log::info!("triangulated {} land rings = {} fill vertices", rings.len(), fill_verts.len());
+        let fill_vbuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("fill-verts"),
+            contents: bytemuck::cast_slice(&fill_verts),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+        let fill_vcount = fill_verts.len() as u32;
+
         // --- Orbiting bodies -------------------------------------------------
         let camera = OrbitCamera::default();
         // `world` is supplied by the caller (real tracked objects or the demo
@@ -484,6 +541,7 @@ impl Renderer {
             bind_group,
             starfield_pipeline,
             globe_pipeline,
+            fill_pipeline,
             lines_back_pipeline,
             lines_pipeline,
             atmosphere_pipeline,
@@ -499,6 +557,8 @@ impl Renderer {
             sphere_icount,
             line_vbuf,
             line_vcount,
+            fill_vbuf,
+            fill_vcount,
             track_vbuf,
             track_vcount,
             marker_quad_vbuf,
@@ -560,7 +620,7 @@ impl Renderer {
                 MarkerInstance {
                     center_size: [p.x, p.y, p.z, MARKER_SIZE * b.category.size_scale()],
                     color: b.color,
-                    kind: if b.category.filled() { 1.0 } else { 0.0 },
+                    kind: b.category.marker_kind(),
                 }
             })
             .collect();
@@ -623,8 +683,21 @@ impl Renderer {
             let ox = px[0] + off_x;
             let oy = px[1] - LABEL_PX * 0.5;
             let alt = (self.world.body_position_eci(i).length() - EARTH_RADIUS_KM).max(0.0);
+            let (lat, lon) = self.world.body_latlon(i);
+            let ns = if lat >= 0.0 { 'N' } else { 'S' };
+            let ew = if lon >= 0.0 { 'E' } else { 'W' };
             emit_text(&mut out, &b.name, ox, oy, b.color, unit, width, height);
             emit_text(&mut out, &format!("{alt:.0} KM"), ox, oy + line_h, b.color, unit, width, height);
+            emit_text(
+                &mut out,
+                &format!("{:.1}{ns} {:.1}{ew}", lat.abs(), lon.abs()),
+                ox,
+                oy + line_h * 2.0,
+                b.color,
+                unit,
+                width,
+                height,
+            );
             if out.len() + 512 > MAX_LABEL_VERTS {
                 break;
             }
@@ -700,6 +773,13 @@ impl Renderer {
             }
 
             // --- Near side: full intensity -----------------------------------
+            // Translucent land fill, under the coastlines/borders.
+            if self.fill_vcount > 0 {
+                rp.set_pipeline(&self.fill_pipeline);
+                rp.set_vertex_buffer(0, self.fill_vbuf.slice(..));
+                rp.draw(0..self.fill_vcount, 0..1);
+            }
+
             // Coastlines + borders.
             rp.set_pipeline(&self.lines_pipeline);
             rp.set_vertex_buffer(0, self.line_vbuf.slice(..));

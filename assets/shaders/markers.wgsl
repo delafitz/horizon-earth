@@ -39,9 +39,29 @@ fn vs_main(
     return o;
 }
 
-// Square coverage at corner `uv` for the given kind. Filled = solid with a soft
-// edge; outline = a thin frame near the border.
-fn square_alpha(uv: vec2<f32>, kind: f32) -> f32 {
+// Distance from point `p` to segment `a`-`b`.
+fn seg_dist(p: vec2<f32>, a: vec2<f32>, b: vec2<f32>) -> f32 {
+    let pa = p - a;
+    let ba = b - a;
+    let h = clamp(dot(pa, ba) / dot(ba, ba), 0.0, 1.0);
+    return length(pa - ba * h);
+}
+
+// Thin outline of an upward-pointing triangle inscribed in the [-1,1] quad.
+fn triangle_alpha(uv: vec2<f32>) -> f32 {
+    let a = vec2<f32>(0.0, 0.9);
+    let b = vec2<f32>(-0.9, -0.7);
+    let c = vec2<f32>(0.9, -0.7);
+    let d = min(min(seg_dist(uv, a, b), seg_dist(uv, b, c)), seg_dist(uv, c, a));
+    return 1.0 - smoothstep(0.06, 0.20, d);
+}
+
+// Marker coverage at corner `uv` for the given kind: 0 = outline box, 1 = filled
+// square (solid with a soft edge), 2 = wire triangle.
+fn marker_alpha(uv: vec2<f32>, kind: f32) -> f32 {
+    if (kind > 1.5) {
+        return triangle_alpha(uv);
+    }
     let m = max(abs(uv.x), abs(uv.y));
     if (kind > 0.5) {
         return 1.0 - smoothstep(0.82, 1.0, m);
@@ -53,7 +73,7 @@ fn square_alpha(uv: vec2<f32>, kind: f32) -> f32 {
 
 @fragment
 fn fs_main(in: VOut) -> @location(0) vec4<f32> {
-    let a = square_alpha(in.uv, in.kind);
+    let a = marker_alpha(in.uv, in.kind);
     if (a < 0.02) {
         discard;
     }
@@ -63,7 +83,7 @@ fn fs_main(in: VOut) -> @location(0) vec4<f32> {
 // Far side (behind the translucent globe): dimmer, seen "through the glass".
 @fragment
 fn fs_back(in: VOut) -> @location(0) vec4<f32> {
-    let a = square_alpha(in.uv, in.kind) * 0.4;
+    let a = marker_alpha(in.uv, in.kind) * 0.4;
     if (a < 0.02) {
         discard;
     }

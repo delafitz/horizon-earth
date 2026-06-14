@@ -54,7 +54,7 @@ impl Category {
     /// Render colour (linear-ish RGB, Nord palette).
     pub fn color(self) -> [f32; 3] {
         match self {
-            Category::Station => [0.925, 0.937, 0.957],  // Nord6  snow
+            Category::Station => [0.369, 0.506, 0.675],   // Nord10 deep frost blue
             Category::Leo => [0.506, 0.631, 0.757],      // Nord9  frost
             Category::Starlink => [0.561, 0.737, 0.733], // Nord7  frost
             Category::Gnss => [0.639, 0.745, 0.549],     // Nord14 green
@@ -63,9 +63,15 @@ impl Category {
         }
     }
 
-    /// Filled square (true) vs outline box (false).
-    pub fn filled(self) -> bool {
-        matches!(self, Category::Station | Category::Geo)
+    /// HUD marker symbol passed to the marker shader:
+    /// `0.0` = outline box, `1.0` = filled square, `2.0` = wire triangle.
+    /// Crewed stations get the distinctive wire triangle.
+    pub fn marker_kind(self) -> f32 {
+        match self {
+            Category::Station => 2.0,
+            Category::Geo => 1.0,
+            _ => 0.0,
+        }
     }
 
     /// On-screen size multiplier — crewed stations are rendered bold.

@@ -65,6 +65,56 @@ fn push_line(coords: &Value, out: &mut Vec<PolyLine>) {
     }
 }
 
+/// Parse a GeoJSON FeatureCollection and return the **outer ring** of every
+/// Polygon / MultiPolygon — the closed land boundaries, ready to be filled.
+/// Holes (inner rings) are skipped so the fill covers the whole landmass.
+pub fn extract_polygon_rings(geojson: &str) -> Vec<PolyLine> {
+    let root: Value = match serde_json::from_str(geojson) {
+        Ok(v) => v,
+        Err(e) => {
+            log::error!("failed to parse GeoJSON: {e}");
+            return Vec::new();
+        }
+    };
+
+    let mut out = Vec::new();
+    let Some(features) = root.get("features").and_then(Value::as_array) else {
+        return out;
+    };
+
+    for feature in features {
+        let geom = match feature.get("geometry") {
+            Some(g) if !g.is_null() => g,
+            _ => continue,
+        };
+        let kind = geom.get("type").and_then(Value::as_str).unwrap_or("");
+        let Some(coords) = geom.get("coordinates") else {
+            continue;
+        };
+        match kind {
+            "Polygon" => push_outer_ring(coords, &mut out),
+            "MultiPolygon" => {
+                if let Some(polys) = coords.as_array() {
+                    for poly in polys {
+                        push_outer_ring(poly, &mut out);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    out
+}
+
+/// `rings` is a polygon's array of rings (outer first, then holes). Push only
+/// the outer ring.
+fn push_outer_ring(rings: &Value, out: &mut Vec<PolyLine>) {
+    if let Some(first) = rings.as_array().and_then(|a| a.first()) {
+        push_line(first, out);
+    }
+}
+
 /// `coords` is an array of lines (each an array of positions).
 fn push_lines(coords: &Value, out: &mut Vec<PolyLine>) {
     if let Some(lines) = coords.as_array() {
