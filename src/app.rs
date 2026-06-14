@@ -17,7 +17,8 @@ use winit::event_loop::ActiveEventLoop;
 use winit::keyboard::{Key, NamedKey};
 use winit::window::{Fullscreen, Window, WindowId};
 
-use crate::renderer::Renderer;
+use crate::renderer::{EguiFrame, Renderer};
+use crate::ui::{self, UiState};
 
 /// How the simulation clock advances.
 #[derive(Clone, Copy, PartialEq)]
@@ -52,6 +53,14 @@ pub struct App {
     dragging: bool,
     no_exit: bool,
     windowed: bool,
+
+    // egui overlay (interactive mode only). The context is cheap to hold even
+    // when unused; the winit integration is created once the window exists.
+    egui_ctx: egui::Context,
+    egui_state: Option<egui_winit::State>,
+    ui: UiState,
+    last_frame: Instant,
+    fps: f32,
 }
 
 impl App {
@@ -68,6 +77,11 @@ impl App {
             dragging: false,
             no_exit,
             windowed,
+            egui_ctx: egui::Context::default(),
+            egui_state: None,
+            ui: UiState::new(!demo, DEFAULT_TIME_SCALE),
+            last_frame: Instant::now(),
+            fps: 0.0,
         }
     }
 
@@ -103,6 +117,137 @@ impl App {
         }
         World::demo(self.epoch0)
     }
+
+    /// Interactive keyboard shortcuts (not consumed by egui).
+    ///   T          toggle live/demo time (reconciled via `ui.live`)
+    ///   F          toggle Fixed (Earth-centred) / Fly (orbit-riding) camera
+    /// Fly mode only:
+    ///   arrows     yaw (left/right), pitch (up/down)
+    ///   Q / E      roll
+    ///   Z / X      orbit speed  -/+
+    ///   G / H      altitude      -/+
+    ///   C / V      inclination   -/+
+    ///   B / N      RAAN          -/+
+    fn handle_shortcut(&mut self, key: &Key) {
+        if let Key::Character(s) = key {
+            if s.eq_ignore_ascii_case("t") {
+                self.ui.live = !self.ui.live;
+                return;
+            }
+            if s.eq_ignore_ascii_case("f") {
+                if let Some(r) = self.renderer.as_mut() {
+                    r.toggle_camera();
+                }
+                return;
+            }
+        }
+
+        let Some(r) = self.renderer.as_mut() else {
+            return;
+        };
+        if !r.is_fly_mode() {
+            return; // the remaining controls steer the fly camera
+        }
+
+        const ANG: f32 = 0.0349; // ~2 degrees per press
+        match key {
+            Key::Named(NamedKey::ArrowLeft) => r.fly_look(-ANG, 0.0, 0.0),
+            Key::Named(NamedKey::ArrowRight) => r.fly_look(ANG, 0.0, 0.0),
+            Key::Named(NamedKey::ArrowUp) => r.fly_look(0.0, ANG, 0.0),
+            Key::Named(NamedKey::ArrowDown) => r.fly_look(0.0, -ANG, 0.0),
+            Key::Character(s) => match s.to_ascii_lowercase().as_str() {
+                "q" => r.fly_look(0.0, 0.0, -ANG),
+                "e" => r.fly_look(0.0, 0.0, ANG),
+                "z" => r.fly_adjust_speed(-0.05),
+                "x" => r.fly_adjust_speed(0.05),
+                "g" => r.fly_adjust_altitude(-50.0),
+                "h" => r.fly_adjust_altitude(50.0),
+                "c" => r.fly_adjust_inclination(-ANG),
+                "v" => r.fly_adjust_inclination(ANG),
+                "b" => r.fly_adjust_raan(-ANG),
+                "n" => r.fly_adjust_raan(ANG),
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+
+    /// Render one frame: reconcile UI-driven state, advance the world, build the
+    /// egui overlay (interactive mode only), and present.
+    fn redraw(&mut self, event_loop: &ActiveEventLoop) {
+        // Reconcile time mode from the UI/keyboard toggle, re-baselining the
+        // demo clock on a change so it doesn't jump.
+        let want = if self.ui.live { TimeMode::Live } else { TimeMode::Demo };
+        if want != self.time_mode {
+            self.time_mode = want;
+            self.start = Instant::now();
+            self.epoch0 = now_epoch();
+        }
+
+        let now = self.current_epoch();
+
+        // Exponential moving-average FPS for the status readout.
+        let dt = self.last_frame.elapsed().as_secs_f32();
+        self.last_frame = Instant::now();
+        if dt > 0.0 {
+            self.fps = if self.fps == 0.0 {
+                1.0 / dt
+            } else {
+                self.fps * 0.9 + 0.1 / dt
+            };
+        }
+
+        let Some(window) = self.window.clone() else {
+            return;
+        };
+        let Some(renderer) = self.renderer.as_mut() else {
+            return;
+        };
+
+        // Push current parameters in, advance the camera along its orbit (fly
+        // mode), then advance the world + GPU buffers.
+        renderer.set_settings(self.ui.settings);
+        renderer.advance_camera(dt);
+        renderer.update(now);
+
+        // Build the egui overlay. The world is borrowed read-only for the UI
+        // pass, then released before the mutable render call below.
+        let egui_data = if self.no_exit {
+            self.egui_state.as_mut().map(|state| {
+                let raw = state.take_egui_input(&window);
+                let info = ui::FrameInfo {
+                    fps: self.fps,
+                    gmst_deg: renderer.world().earth_rotation().to_degrees(),
+                };
+                let ui_state = &mut self.ui;
+                let world = renderer.world();
+                let out = self
+                    .egui_ctx
+                    .run(raw, |ctx| ui::draw(ctx, ui_state, world, &info));
+                state.handle_platform_output(&window, out.platform_output);
+                let prims = self.egui_ctx.tessellate(out.shapes, out.pixels_per_point);
+                (prims, out.textures_delta, out.pixels_per_point)
+            })
+        } else {
+            None
+        };
+
+        let frame = egui_data.as_ref().map(|(prims, td, ppp)| EguiFrame {
+            primitives: prims,
+            textures_delta: td,
+            pixels_per_point: *ppp,
+        });
+
+        match renderer.render(frame) {
+            Ok(()) => {}
+            Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
+                let size = window.inner_size();
+                renderer.resize(size.width, size.height);
+            }
+            Err(wgpu::SurfaceError::OutOfMemory) => event_loop.exit(),
+            Err(e) => log::warn!("surface error: {e:?}"),
+        }
+    }
 }
 
 impl ApplicationHandler for App {
@@ -126,6 +271,18 @@ impl ApplicationHandler for App {
         // Hide the cursor in screensaver mode.
         window.set_cursor_visible(self.windowed);
 
+        // egui winit integration (used only in interactive mode, but cheap to
+        // wire up unconditionally).
+        ui::install_theme(&self.egui_ctx);
+        self.egui_state = Some(egui_winit::State::new(
+            self.egui_ctx.clone(),
+            egui::ViewportId::ROOT,
+            &window,
+            Some(window.scale_factor() as f32),
+            None,
+            Some(2048),
+        ));
+
         self.start = Instant::now();
         self.epoch0 = now_epoch();
         let world = self.build_world();
@@ -142,6 +299,18 @@ impl ApplicationHandler for App {
         _id: WindowId,
         event: WindowEvent,
     ) {
+        // Let egui see the event first (interactive mode). If it consumes the
+        // event — e.g. a pointer over a panel or typing in the filter box — we
+        // skip the camera/exit handling below so the UI and globe don't fight.
+        let mut egui_consumed = false;
+        if self.no_exit {
+            if let Some(window) = self.window.as_ref() {
+                if let Some(state) = self.egui_state.as_mut() {
+                    egui_consumed = state.on_window_event(window, &event).consumed;
+                }
+            }
+        }
+
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
 
@@ -152,17 +321,10 @@ impl ApplicationHandler for App {
                         event_loop.exit();
                         return;
                     }
-                    // Interactive-only shortcuts. 'T' toggles live/demo time.
-                    if let Key::Character(s) = &event.logical_key {
-                        if s.eq_ignore_ascii_case("t") {
-                            self.time_mode = match self.time_mode {
-                                TimeMode::Live => TimeMode::Demo,
-                                TimeMode::Demo => TimeMode::Live,
-                            };
-                            // Re-baseline so the demo clock doesn't jump.
-                            self.start = Instant::now();
-                            self.epoch0 = now_epoch();
-                        }
+                    // Interactive-only shortcuts (skipped when egui is using the
+                    // key, e.g. typing in the filter box).
+                    if !egui_consumed {
+                        self.handle_shortcut(&event.logical_key);
                     }
                 }
             }
@@ -171,8 +333,9 @@ impl ApplicationHandler for App {
             // Screensaver: any press is "activity" and quits.
             WindowEvent::MouseInput { state, button, .. } => {
                 if self.no_exit {
+                    // A press over a panel belongs to egui, not the camera.
                     if button == MouseButton::Left {
-                        self.dragging = state == ElementState::Pressed;
+                        self.dragging = state == ElementState::Pressed && !egui_consumed;
                     }
                 } else if state == ElementState::Pressed {
                     event_loop.exit();
@@ -181,6 +344,9 @@ impl ApplicationHandler for App {
 
             WindowEvent::MouseWheel { delta, .. } => {
                 if self.no_exit {
+                    if egui_consumed {
+                        return; // scrolling a panel/list, not zooming the globe
+                    }
                     let y = match delta {
                         MouseScrollDelta::LineDelta(_, y) => y,
                         MouseScrollDelta::PixelDelta(p) => p.y as f32 / 50.0,
@@ -221,21 +387,7 @@ impl ApplicationHandler for App {
                 }
             }
 
-            WindowEvent::RedrawRequested => {
-                let now = self.current_epoch();
-                if let (Some(r), Some(w)) = (self.renderer.as_mut(), self.window.as_ref()) {
-                    r.update(now);
-                    match r.render() {
-                        Ok(()) => {}
-                        Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
-                            let size = w.inner_size();
-                            r.resize(size.width, size.height);
-                        }
-                        Err(wgpu::SurfaceError::OutOfMemory) => event_loop.exit(),
-                        Err(e) => log::warn!("surface error: {e:?}"),
-                    }
-                }
-            }
+            WindowEvent::RedrawRequested => self.redraw(event_loop),
 
             _ => {}
         }

@@ -5,6 +5,10 @@ struct U {
     view_proj: mat4x4<f32>,
     model: mat4x4<f32>,
     cam_pos: vec4<f32>,
+    params: vec4<f32>,
+    // [egui] x = far-side line alpha, y = land fill alpha, z = track alpha,
+    // w = line brightness.
+    style0: vec4<f32>,
 };
 @group(0) @binding(0) var<uniform> u: U;
 
@@ -24,14 +28,14 @@ fn vs_main(@location(0) pos: vec3<f32>, @location(1) col: vec3<f32>) -> VOut {
 
 @fragment
 fn fs_main(in: VOut) -> @location(0) vec4<f32> {
-    return vec4<f32>(in.col, 1.0);
+    return vec4<f32>(in.col * u.style0.w, 1.0);
 }
 
 // Far-hemisphere variant: faint, alpha-blended so the back of the globe's
 // coastlines/borders read in darker contrast through the translucent surface.
 @fragment
 fn fs_back(in: VOut) -> @location(0) vec4<f32> {
-    return vec4<f32>(in.col, 0.28);
+    return vec4<f32>(in.col * u.style0.w, u.style0.x);
 }
 
 // Land fill: the closed country rings drawn as triangles at low opacity, giving
@@ -65,5 +69,5 @@ fn fs_fill(in: FillOut) -> @location(0) vec4<f32> {
     if (dot(n, v) <= 0.0) {
         discard;
     }
-    return vec4<f32>(in.col, 0.20);
+    return vec4<f32>(in.col, u.style0.y);
 }

@@ -23,7 +23,7 @@ pub mod time;
 pub mod units;
 pub mod world;
 
-pub use camera::OrbitCamera;
+pub use camera::{CameraMode, CameraRig, FlyCamera, OrbitCamera};
 pub use category::Category;
 pub use orbit::{KeplerOrbit, Propagator, Sgp4Orbit};
 pub use time::{gmst, Epoch};

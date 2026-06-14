@@ -9,12 +9,14 @@ struct U {
     model: mat4x4<f32>,
     cam_pos: vec4<f32>,
     params: vec4<f32>,
+    style0: vec4<f32>,
+    // [egui] x = glow intensity, y = outer shell radius (atmosphere "depth").
+    style1: vec4<f32>,
 };
 @group(0) @binding(0) var<uniform> u: U;
 
-// Globe radius and the atmosphere's outer reach (must match the shell scale).
+// Globe radius; the atmosphere's outer reach is UI-driven (u.style1.y).
 const SURFACE: f32 = 1.0;
-const OUTER: f32 = 1.06;
 
 struct VOut {
     @builtin(position) clip: vec4<f32>,
@@ -25,7 +27,7 @@ struct VOut {
 @vertex
 fn vs_main(@location(0) pos: vec3<f32>) -> VOut {
     var o: VOut;
-    let world = pos * OUTER;
+    let world = pos * u.style1.y;
     o.world = world;
     o.nrm = normalize(pos);
     o.clip = u.view_proj * vec4<f32>(world, 1.0);
@@ -50,8 +52,8 @@ fn fs_main(in: VOut) -> @location(0) vec4<f32> {
     // Glow hugs the surface (bright near b = SURFACE), ramps in gently just
     // inside the limb, and fades to transparent at the outer edge.
     let inner = smoothstep(0.985, SURFACE, b);
-    let fade = 1.0 - smoothstep(SURFACE, OUTER, b);
-    let glow = inner * fade * 0.45;
+    let fade = 1.0 - smoothstep(SURFACE, u.style1.y, b);
+    let glow = inner * fade * u.style1.x;
 
     let col = vec3<f32>(0.506, 0.631, 0.757); // Nord9 #81A1C1
     return vec4<f32>(col * glow, glow);

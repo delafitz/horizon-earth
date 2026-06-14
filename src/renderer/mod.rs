@@ -13,8 +13,18 @@ use winit::window::Window;
 use horizon_core::frames::eci_to_world;
 use horizon_core::orbit::sample_track;
 use horizon_core::units::EARTH_RADIUS_KM;
-use horizon_core::{Epoch, OrbitCamera, World};
+use horizon_core::{CameraRig, Epoch, World};
 use mesh::{MarkerInstance, VertexPC, VertexPN};
+
+use crate::ui::RenderSettings;
+
+/// [egui] One frame of tessellated egui geometry, painted over the 3D scene by
+/// [`Renderer::render`]. `None` means no overlay this frame.
+pub struct EguiFrame<'a> {
+    pub primitives: &'a [egui::ClippedPrimitive],
+    pub textures_delta: &'a egui::TexturesDelta,
+    pub pixels_per_point: f32,
+}
 
 // Natural Earth vector data, embedded so the binary is self-contained.
 const COASTLINE_GEOJSON: &str = include_str!("../../assets/earth/ne_110m_coastline.geojson");
@@ -61,6 +71,11 @@ struct Uniforms {
     model: [[f32; 4]; 4],
     cam_pos: [f32; 4],
     params: [f32; 4], // params.x = viewport aspect
+    // [egui] UI-driven style knobs, appended so shaders that don't read them are
+    // unaffected (each shader declares only the prefix it needs).
+    style0: [f32; 4], // x = far-side line alpha, y = land fill alpha,
+    // z = orbit-track alpha, w = line brightness
+    style1: [f32; 4], // x = atmosphere intensity, y = atmosphere outer radius
 }
 
 pub struct Renderer {
@@ -104,8 +119,12 @@ pub struct Renderer {
     marker_quad_vbuf: wgpu::Buffer,
     marker_inst_buf: wgpu::Buffer,
 
-    camera: OrbitCamera,
+    camera: CameraRig,
     world: World,
+
+    // [egui] overlay painter + the live parameter values the UI drives.
+    egui_renderer: egui_wgpu::Renderer,
+    settings: RenderSettings,
 }
 
 impl Renderer {
@@ -463,7 +482,7 @@ impl Renderer {
         let fill_vcount = fill_verts.len() as u32;
 
         // --- Orbiting bodies -------------------------------------------------
-        let camera = OrbitCamera::default();
+        let camera = CameraRig::default();
         // `world` is supplied by the caller (real tracked objects or the demo
         // constellation).
 
@@ -531,6 +550,9 @@ impl Renderer {
             mapped_at_creation: false,
         });
 
+        // [egui] Painter targeting the same surface format; no depth, no MSAA.
+        let egui_renderer = egui_wgpu::Renderer::new(&device, format, None, 1, false);
+
         Renderer {
             surface,
             device,
@@ -565,7 +587,19 @@ impl Renderer {
             marker_inst_buf,
             camera,
             world,
+            egui_renderer,
+            settings: RenderSettings::default(),
         }
+    }
+
+    /// [egui] Copy the current UI-driven parameters in; read during update/render.
+    pub fn set_settings(&mut self, settings: RenderSettings) {
+        self.settings = settings;
+    }
+
+    /// Read-only access to the simulated world (for the UI panels).
+    pub fn world(&self) -> &World {
+        &self.world
     }
 
     pub fn resize(&mut self, width: u32, height: u32) {
@@ -578,14 +612,57 @@ impl Renderer {
         self.depth_view = create_depth_view(&self.device, &self.config);
     }
 
-    /// Orbit the camera by pixel-scaled yaw/pitch deltas.
+    /// Orbit the fixed camera by pixel-scaled yaw/pitch deltas (Fixed mode).
     pub fn orbit_camera(&mut self, dyaw: f32, dpitch: f32) {
-        self.camera.orbit(dyaw as f64, dpitch as f64);
+        self.camera.orbit.orbit(dyaw as f64, dpitch as f64);
     }
 
-    /// Dolly the camera in (positive) or out (negative).
+    /// Dolly the fixed camera in (positive) or out (negative).
     pub fn zoom_camera(&mut self, factor: f32) {
-        self.camera.zoom(factor as f64);
+        self.camera.orbit.zoom(factor as f64);
+    }
+
+    /// Toggle between the Fixed (Earth-centred) and Fly (orbit-riding) cameras.
+    pub fn toggle_camera(&mut self) {
+        self.camera.toggle();
+        log::info!("camera mode: {:?}", self.camera.mode);
+    }
+
+    /// True when the fly camera is active (so the app can route attitude keys).
+    pub fn is_fly_mode(&self) -> bool {
+        self.camera.mode == horizon_core::CameraMode::Fly
+    }
+
+    /// Advance the camera (only the fly camera moves) by `dt` seconds.
+    pub fn advance_camera(&mut self, dt: f32) {
+        self.camera.advance(dt as f64);
+    }
+
+    /// Adjust fly-orbit speed (rad/s along the orbit).
+    pub fn fly_adjust_speed(&mut self, delta: f32) {
+        self.camera.fly.adjust_speed(delta as f64);
+    }
+
+    /// Adjust fly-orbit altitude (km).
+    pub fn fly_adjust_altitude(&mut self, delta_km: f32) {
+        self.camera.fly.adjust_altitude(delta_km as f64);
+    }
+
+    /// Adjust fly-orbit inclination (radians).
+    pub fn fly_adjust_inclination(&mut self, delta: f32) {
+        self.camera.fly.adjust_inclination(delta as f64);
+    }
+
+    /// Adjust fly-orbit RAAN (radians).
+    pub fn fly_adjust_raan(&mut self, delta: f32) {
+        self.camera.fly.adjust_raan(delta as f64);
+    }
+
+    /// Nudge the fly camera's attitude (yaw/pitch/roll, radians).
+    pub fn fly_look(&mut self, dyaw: f32, dpitch: f32, droll: f32) {
+        self.camera.fly.yaw += dyaw as f64;
+        self.camera.fly.pitch += dpitch as f64;
+        self.camera.fly.roll += droll as f64;
     }
 
     /// Set the world to time `now` and refresh per-frame GPU state.
@@ -602,11 +679,14 @@ impl Renderer {
         let spin = self.world.earth_rotation().rem_euclid(std::f64::consts::TAU) as f32;
         let model = Mat4::from_rotation_y(spin);
 
+        let s = &self.settings;
         let u = Uniforms {
             view_proj: view_proj.to_cols_array_2d(),
             model: model.to_cols_array_2d(),
             cam_pos: [eye.x, eye.y, eye.z, 1.0],
             params: [aspect, width, height, 0.0],
+            style0: [s.line_back_alpha, s.fill_alpha, s.track_alpha, s.line_brightness],
+            style1: [s.atmo_intensity, 1.0 + s.atmo_thickness, 0.0, 0.0],
         };
         self.queue
             .write_buffer(&self.uniform_buf, 0, bytemuck::cast_slice(&[u]));
@@ -618,20 +698,35 @@ impl Renderer {
                 let p = eci_to_world(self.world.body_position_eci(i)).as_vec3();
                 let b = &self.world.bodies[i];
                 MarkerInstance {
-                    center_size: [p.x, p.y, p.z, MARKER_SIZE * b.category.size_scale()],
+                    center_size: [
+                        p.x,
+                        p.y,
+                        p.z,
+                        MARKER_SIZE * b.category.size_scale() * self.settings.marker_size,
+                    ],
                     color: b.color,
-                    kind: b.category.marker_kind(),
+                    kind: self.settings.symbol_kind(b.category),
                 }
             })
             .collect();
         self.queue
             .write_buffer(&self.marker_inst_buf, 0, bytemuck::cast_slice(&instances));
 
-        // HUD labels: project bodies to screen, drop occluded/overlapping ones.
-        let verts = self.build_labels(view_proj, eye, width, height);
+        // HUD labels: the fly-mode controls banner first (so it always shows),
+        // then per-body labels (name/altitude/lat-lon), projected to screen.
+        let mut verts: Vec<mesh::LabelVertex> = Vec::new();
+        if self.is_fly_mode() {
+            emit_fly_banner(&mut verts, width, height);
+        }
+        if self.settings.show_labels {
+            verts.extend(self.build_labels(view_proj, eye, width, height));
+        }
+        verts.truncate(MAX_LABEL_VERTS);
         self.label_vcount = verts.len() as u32;
-        self.queue
-            .write_buffer(&self.label_vbuf, 0, bytemuck::cast_slice(&verts));
+        if !verts.is_empty() {
+            self.queue
+                .write_buffer(&self.label_vbuf, 0, bytemuck::cast_slice(&verts));
+        }
     }
 
     /// Build line vertices for visible body labels (name + altitude), in the
@@ -705,7 +800,7 @@ impl Renderer {
         out
     }
 
-    pub fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
+    pub fn render(&mut self, egui: Option<EguiFrame>) -> Result<(), wgpu::SurfaceError> {
         let frame = self.surface.get_current_texture()?;
         let view = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
         let mut enc = self
@@ -758,7 +853,7 @@ impl Renderer {
             rp.draw(0..self.line_vcount, 0..1);
 
             // Orbit tracks.
-            if self.track_vcount > 0 {
+            if self.track_vcount > 0 && self.settings.show_tracks {
                 rp.set_pipeline(&self.track_back_pipeline);
                 rp.set_vertex_buffer(0, self.track_vbuf.slice(..));
                 rp.draw(0..self.track_vcount, 0..1);
@@ -786,17 +881,19 @@ impl Renderer {
             rp.draw(0..self.line_vcount, 0..1);
 
             // Orbit tracks.
-            if self.track_vcount > 0 {
+            if self.track_vcount > 0 && self.settings.show_tracks {
                 rp.set_pipeline(&self.track_pipeline);
                 rp.set_vertex_buffer(0, self.track_vbuf.slice(..));
                 rp.draw(0..self.track_vcount, 0..1);
             }
 
             // Atmospheric glow.
-            rp.set_pipeline(&self.atmosphere_pipeline);
-            rp.set_vertex_buffer(0, self.sphere_vbuf.slice(..));
-            rp.set_index_buffer(self.sphere_ibuf.slice(..), wgpu::IndexFormat::Uint32);
-            rp.draw_indexed(0..self.sphere_icount, 0, 0..1);
+            if self.settings.show_atmosphere {
+                rp.set_pipeline(&self.atmosphere_pipeline);
+                rp.set_vertex_buffer(0, self.sphere_vbuf.slice(..));
+                rp.set_index_buffer(self.sphere_ibuf.slice(..), wgpu::IndexFormat::Uint32);
+                rp.draw_indexed(0..self.sphere_icount, 0, 0..1);
+            }
 
             // Bodies in front, drawn last so they read crisply.
             if body_count > 0 {
@@ -814,8 +911,56 @@ impl Renderer {
             }
         }
 
-        self.queue.submit(Some(enc.finish()));
+        // [egui] Overlay pass: load (don't clear) the 3D scene, then paint the
+        // panels on top. Buffer/texture prep records into the same encoder; any
+        // returned user command buffers must run before it.
+        let mut egui_cmds = Vec::new();
+        if let Some(eg) = &egui {
+            let desc = egui_wgpu::ScreenDescriptor {
+                size_in_pixels: [self.config.width, self.config.height],
+                pixels_per_point: eg.pixels_per_point,
+            };
+            for (id, delta) in &eg.textures_delta.set {
+                self.egui_renderer
+                    .update_texture(&self.device, &self.queue, *id, delta);
+            }
+            egui_cmds = self.egui_renderer.update_buffers(
+                &self.device,
+                &self.queue,
+                &mut enc,
+                eg.primitives,
+                &desc,
+            );
+
+            let mut rp = enc
+                .begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("egui-pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &view,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Load,
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                })
+                .forget_lifetime();
+            self.egui_renderer.render(&mut rp, eg.primitives, &desc);
+        }
+
+        egui_cmds.push(enc.finish());
+        self.queue.submit(egui_cmds);
         frame.present();
+
+        // Free textures egui retired this frame (after submit, per egui's API).
+        if let Some(eg) = &egui {
+            for id in &eg.textures_delta.free {
+                self.egui_renderer.free_texture(id);
+            }
+        }
         Ok(())
     }
 }
@@ -869,6 +1014,24 @@ fn occluded_by_globe(eye: Vec3, p: Vec3) -> bool {
 /// Append vector-stroke line vertices for one line of `text`, with its top-left
 /// at screen pixel `(ox, oy)`. `unit` is pixels per glyph grid unit.
 #[allow(clippy::too_many_arguments)]
+/// Draw the fly-camera controls legend across the top of the screen. The font
+/// is auto-sized so the whole line fits the viewport width.
+fn emit_fly_banner(out: &mut Vec<mesh::LabelVertex>, width: f32, height: f32) {
+    const TEXT: &str =
+        "FLY  F:EXIT  ARROWS:LOOK  Q/E:ROLL  Z/X:SPEED  G/H:ALT  C/V:INCL  B/N:RAAN";
+    const MARGIN: f32 = 20.0;
+    const BANNER_PX_MAX: f32 = 16.0;
+
+    // advance per char = (GW + 1) * unit, with unit = px / GH. Solve the unit
+    // that makes the line span at most (width - 2*margin), capped at the max.
+    let advance_units = (glyphs::GW + 1.0) * TEXT.len() as f32;
+    let fit_unit = (width - 2.0 * MARGIN).max(1.0) / advance_units;
+    let unit = fit_unit.min(BANNER_PX_MAX / glyphs::GH);
+    let color = [0.925, 0.937, 0.957]; // Nord6 snow
+
+    emit_text(out, TEXT, MARGIN, 14.0, color, unit, width, height);
+}
+
 fn emit_text(
     out: &mut Vec<mesh::LabelVertex>,
     text: &str,

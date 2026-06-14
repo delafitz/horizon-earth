@@ -8,6 +8,7 @@ struct U {
     model: mat4x4<f32>,
     cam_pos: vec4<f32>,
     params: vec4<f32>,
+    style0: vec4<f32>, // [egui] z = orbit-track alpha (near); back side is 0.4×
 };
 @group(0) @binding(0) var<uniform> u: U;
 
@@ -26,11 +27,11 @@ fn vs_main(@location(0) pos: vec3<f32>, @location(1) col: vec3<f32>) -> VOut {
 
 @fragment
 fn fs_main(in: VOut) -> @location(0) vec4<f32> {
-    return vec4<f32>(in.col, 0.35);
+    return vec4<f32>(in.col, u.style0.z);
 }
 
 // Far side (behind the translucent globe): fainter, seen "through the glass".
 @fragment
 fn fs_back(in: VOut) -> @location(0) vec4<f32> {
-    return vec4<f32>(in.col, 0.14);
+    return vec4<f32>(in.col, u.style0.z * 0.4);
 }
