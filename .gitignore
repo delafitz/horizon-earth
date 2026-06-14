@@ -1,0 +1,8 @@
+.claude/settings.local.json
+
+# Rust
+/target
+
+# Runtime caches (e.g. downloaded TLE data in later phases)
+/cache/*
+!/cache/.gitkeep

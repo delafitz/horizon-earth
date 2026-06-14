@@ -1,0 +1,23 @@
+[package]
+name = "horizon-earth"
+version = "0.1.0"
+edition = "2021"
+description = "A Nord-themed 3D Earth visualization for Wayland desktops"
+
+[[bin]]
+name = "horizon"
+path = "src/main.rs"
+
+[dependencies]
+winit = "0.30"
+wgpu = "22.1"
+pollster = "0.3"
+bytemuck = { version = "1", features = ["derive"] }
+glam = "0.29"
+serde_json = "1"
+log = "0.4"
+env_logger = "0.11"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
