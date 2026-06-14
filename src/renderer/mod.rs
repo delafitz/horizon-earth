@@ -125,6 +125,9 @@ pub struct Renderer {
     // [egui] overlay painter + the live parameter values the UI drives.
     egui_renderer: egui_wgpu::Renderer,
     settings: RenderSettings,
+    // [egui] which categories currently have orbit tracks in `track_vbuf`;
+    // rebuilt when the per-type selection changes.
+    track_mask: u32,
 }
 
 impl Renderer {
@@ -589,6 +592,35 @@ impl Renderer {
             world,
             egui_renderer,
             settings: RenderSettings::default(),
+            // The track buffer above is built for every body (all categories on).
+            track_mask: RenderSettings::default().track_mask(),
+        }
+    }
+
+    /// [egui] Rebuild the orbit-track vertex buffer, including only categories
+    /// whose per-type "orbit track" toggle is on. Called when that set changes.
+    fn rebuild_tracks(&mut self) {
+        let mut verts: Vec<VertexPC> = Vec::new();
+        for body in &self.world.bodies {
+            if !self.settings.track_visible(body.category) {
+                continue;
+            }
+            let col = [body.color[0] * 0.85, body.color[1] * 0.85, body.color[2] * 0.85];
+            let pts = sample_track(body.motion.as_ref(), 128);
+            for w in pts.windows(2) {
+                verts.push(VertexPC { pos: eci_to_world(w[0]).as_vec3().to_array(), col });
+                verts.push(VertexPC { pos: eci_to_world(w[1]).as_vec3().to_array(), col });
+            }
+        }
+        self.track_vcount = verts.len() as u32;
+        // Keep the old buffer when empty (zero-size buffers are invalid); the
+        // zero vcount already suppresses the draw.
+        if !verts.is_empty() {
+            self.track_vbuf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("track-verts"),
+                contents: bytemuck::cast_slice(&verts),
+                usage: wgpu::BufferUsages::VERTEX,
+            });
         }
     }
 
@@ -702,7 +734,10 @@ impl Renderer {
                         p.x,
                         p.y,
                         p.z,
-                        MARKER_SIZE * b.category.size_scale() * self.settings.marker_size,
+                        MARKER_SIZE
+                            * b.category.size_scale()
+                            * self.settings.marker_size
+                            * self.settings.marker_scale(b.category),
                     ],
                     color: b.color,
                     kind: self.settings.symbol_kind(b.category),
@@ -711,6 +746,13 @@ impl Renderer {
             .collect();
         self.queue
             .write_buffer(&self.marker_inst_buf, 0, bytemuck::cast_slice(&instances));
+
+        // [egui] Rebuild orbit tracks only when the per-type selection changes.
+        let mask = self.settings.track_mask();
+        if mask != self.track_mask {
+            self.track_mask = mask;
+            self.rebuild_tracks();
+        }
 
         // HUD labels: the fly-mode controls banner first (so it always shows),
         // then per-body labels (name/altitude/lat-lon), projected to screen.
@@ -748,6 +790,10 @@ impl Renderer {
         // Project every visible body; collect (camera distance, screen px, index).
         let mut cands: Vec<(f32, [f32; 2], usize)> = Vec::new();
         for i in 0..self.world.bodies.len() {
+            // Skip types the user has hidden (their markers are hidden too).
+            if !self.settings.label_visible(self.world.bodies[i].category) {
+                continue;
+            }
             let p = eci_to_world(self.world.body_position_eci(i)).as_vec3();
             if occluded_by_globe(eye, p) {
                 continue;

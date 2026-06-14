@@ -24,8 +24,9 @@ pub struct RenderSettings {
     pub show_tracks: bool,
     /// Near-side orbit-track opacity (far side is drawn at 0.4× this).
     pub track_alpha: f32,
-    /// Per-type marker symbol override, indexed parallel to [`CATEGORIES`].
-    pub symbols: [Symbol; CATEGORIES.len()],
+    /// Per-type attributes (visibility, symbol, size, track), indexed parallel
+    /// to [`CATEGORIES`].
+    pub types: [TypeStyle; CATEGORIES.len()],
 
     // --- Land (coastlines / borders / fill) ---
     /// Multiplier on coastline & border line colour.
@@ -50,7 +51,7 @@ impl Default for RenderSettings {
             show_labels: true,
             show_tracks: true,
             track_alpha: 0.35,
-            symbols: [Symbol::Auto; CATEGORIES.len()],
+            types: [TypeStyle::default(); CATEGORIES.len()],
             line_brightness: 1.0,
             line_back_alpha: 0.28,
             fill_alpha: 0.20,
@@ -61,11 +62,68 @@ impl Default for RenderSettings {
     }
 }
 
+/// Index of `cat` within [`CATEGORIES`].
+fn type_index(cat: Category) -> usize {
+    CATEGORIES.iter().position(|&c| c == cat).unwrap_or(0)
+}
+
 impl RenderSettings {
+    fn ty(&self, cat: Category) -> &TypeStyle {
+        &self.types[type_index(cat)]
+    }
+
     /// Marker `kind` for a body of category `cat`, after any per-type override.
     pub fn symbol_kind(&self, cat: Category) -> f32 {
-        let i = CATEGORIES.iter().position(|&c| c == cat).unwrap_or(0);
-        self.symbols[i].kind(cat)
+        self.ty(cat).symbol.kind(cat)
+    }
+
+    /// Per-type marker size multiplier — `0.0` when the type is hidden, which
+    /// collapses its billboards to nothing.
+    pub fn marker_scale(&self, cat: Category) -> f32 {
+        let t = self.ty(cat);
+        if t.visible {
+            t.size
+        } else {
+            0.0
+        }
+    }
+
+    /// Whether HUD labels for category `cat` should be drawn.
+    pub fn label_visible(&self, cat: Category) -> bool {
+        self.ty(cat).visible
+    }
+
+    /// Whether orbit tracks for category `cat` should be drawn.
+    pub fn track_visible(&self, cat: Category) -> bool {
+        self.ty(cat).show_track
+    }
+
+    /// Bitmask (one bit per [`CATEGORIES`] slot) of which types show orbit
+    /// tracks — the renderer rebuilds the track buffer when this changes.
+    pub fn track_mask(&self) -> u32 {
+        let mut m = 0;
+        for (i, t) in self.types.iter().enumerate() {
+            if t.show_track {
+                m |= 1 << i;
+            }
+        }
+        m
+    }
+}
+
+/// Per-satellite-type render attributes.
+#[derive(Clone, Copy)]
+pub struct TypeStyle {
+    pub visible: bool,
+    pub symbol: Symbol,
+    /// On-screen marker size multiplier for this type.
+    pub size: f32,
+    pub show_track: bool,
+}
+
+impl Default for TypeStyle {
+    fn default() -> Self {
+        Self { visible: true, symbol: Symbol::Auto, size: 1.0, show_track: true }
     }
 }
 
@@ -279,30 +337,30 @@ fn properties_panel(ctx: &Context, ui: &mut UiState, world: &World) {
                         egui::Slider::new(&mut s.track_alpha, 0.0..=1.0).text("track opacity"),
                     );
                     c.add_space(4.0);
-                    c.label(RichText::new("SYMBOL BY TYPE").weak());
-                    egui::Grid::new("symbols")
-                        .num_columns(2)
-                        .spacing([8.0, 4.0])
-                        .show(c, |g| {
-                            for (i, &cat) in CATEGORIES.iter().enumerate() {
-                                g.label(
-                                    RichText::new(category_label(cat)).color(nord(cat.color())),
-                                );
-                                egui::ComboBox::from_id_salt(("symbol", i))
-                                    .selected_text(s.symbols[i].label())
-                                    .width(96.0)
-                                    .show_ui(g, |cb| {
-                                        for opt in Symbol::ALL {
-                                            cb.selectable_value(
-                                                &mut s.symbols[i],
-                                                opt,
-                                                opt.label(),
-                                            );
-                                        }
-                                    });
-                                g.end_row();
-                            }
-                        });
+                    c.label(RichText::new("BY TYPE").weak());
+                    for (i, &cat) in CATEGORIES.iter().enumerate() {
+                        let t = &mut s.types[i];
+                        let header = RichText::new(category_label(cat)).color(nord(cat.color()));
+                        egui::CollapsingHeader::new(header)
+                            .id_salt(("type", i))
+                            .default_open(false)
+                            .show(c, |g| {
+                                g.checkbox(&mut t.visible, "visible");
+                                g.horizontal(|h| {
+                                    h.label("symbol");
+                                    egui::ComboBox::from_id_salt(("symbol", i))
+                                        .selected_text(t.symbol.label())
+                                        .width(104.0)
+                                        .show_ui(h, |cb| {
+                                            for opt in Symbol::ALL {
+                                                cb.selectable_value(&mut t.symbol, opt, opt.label());
+                                            }
+                                        });
+                                });
+                                g.add(egui::Slider::new(&mut t.size, 0.25..=4.0).text("size ×"));
+                                g.checkbox(&mut t.show_track, "orbit track");
+                            });
+                    }
                 });
 
             egui::CollapsingHeader::new("Land")
