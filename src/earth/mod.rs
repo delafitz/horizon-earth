@@ -9,7 +9,7 @@
 use horizon_core::frames::geo_to_render;
 
 use crate::data::PolyLine;
-use crate::renderer::mesh::VertexPC;
+use crate::renderer::mesh::{self, VertexPC};
 
 /// Convert geographic coordinates (degrees) to render-frame coordinates at the
 /// given render radius (Earth surface = 1.0).
@@ -17,15 +17,25 @@ pub fn latlon_to_xyz(lon_deg: f64, lat_deg: f64, radius: f32) -> [f32; 3] {
     geo_to_render(lon_deg, lat_deg, radius as f64).as_vec3().to_array()
 }
 
-/// Append every polyline to `out` as a list of GPU line segments (LineList
-/// topology: two vertices per segment), projected onto the sphere.
-pub fn build_lines(lines: &[PolyLine], color: [f32; 3], radius: f32, out: &mut Vec<VertexPC>) {
+/// Append every polyline segment as a thick-line instance (one per segment),
+/// projected onto the sphere. `layer` (0.0 = coastline, 1.0 = border) tells the
+/// shader which width to use. The vertex shader expands each segment into a
+/// constant-pixel-width quad, so width stays a live uniform, not baked geometry.
+pub fn build_thick_lines(
+    lines: &[PolyLine],
+    color: [f32; 3],
+    layer: f32,
+    radius: f32,
+    out: &mut Vec<mesh::ThickLineInstance>,
+) {
+    let col_layer = [color[0], color[1], color[2], layer];
     for line in lines {
         for pair in line.windows(2) {
-            let a = latlon_to_xyz(pair[0][0], pair[0][1], radius);
-            let b = latlon_to_xyz(pair[1][0], pair[1][1], radius);
-            out.push(VertexPC { pos: a, col: color });
-            out.push(VertexPC { pos: b, col: color });
+            out.push(mesh::ThickLineInstance {
+                p0: latlon_to_xyz(pair[0][0], pair[0][1], radius),
+                p1: latlon_to_xyz(pair[1][0], pair[1][1], radius),
+                col_layer,
+            });
         }
     }
 }

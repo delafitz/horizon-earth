@@ -48,6 +48,29 @@ pub const MARKER_QUAD: [[f32; 2]; 6] = [
     [-1.0, 1.0],
 ];
 
+/// Per-instance data for a thick (screen-space-expanded) line segment. One
+/// instance per coastline/border segment; the vertex shader extrudes the
+/// segment into a constant-pixel-width quad.
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable)]
+pub struct ThickLineInstance {
+    pub p0: [f32; 3],
+    pub p1: [f32; 3],
+    /// rgb colour + `layer` (0.0 = coastline, 1.0 = border) selecting the width.
+    pub col_layer: [f32; 4],
+}
+
+/// Two-triangle quad for a thick line, as `(t, side)` corners: `t` picks the
+/// endpoint (0 = p0, 1 = p1), `side` (-1/+1) the offset direction.
+pub const LINE_QUAD: [[f32; 2]; 6] = [
+    [0.0, -1.0],
+    [1.0, -1.0],
+    [1.0, 1.0],
+    [0.0, -1.0],
+    [1.0, 1.0],
+    [0.0, 1.0],
+];
+
 /// Build a UV sphere. `stacks` are latitude bands, `sectors` are longitude
 /// divisions. Returns vertices (position + outward normal) and triangle
 /// indices.

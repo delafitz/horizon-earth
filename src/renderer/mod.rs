@@ -53,6 +53,14 @@ const ATTRS_CORNER: [wgpu::VertexAttribute; 1] = wgpu::vertex_attr_array![0 => F
 // loc 1 = center+size (vec4); loc 2 = color.rgb + kind (vec4).
 const ATTRS_MARKER_INST: [wgpu::VertexAttribute; 2] =
     wgpu::vertex_attr_array![1 => Float32x4, 2 => Float32x4];
+// Thick-line instance: loc 1 = p0, loc 2 = p1, loc 3 = rgb + layer.
+const ATTRS_THICK_INST: [wgpu::VertexAttribute; 3] =
+    wgpu::vertex_attr_array![1 => Float32x3, 2 => Float32x3, 3 => Float32x4];
+
+// Default coastline / border line widths (px). The egui panel can override
+// these via style1.z / style1.w; kept as constants until that slider lands.
+const COAST_WIDTH_PX: f32 = 2.0;
+const BORDER_WIDTH_PX: f32 = 1.4;
 
 // On-screen half-size of a body marker, in NDC units.
 const MARKER_SIZE: f32 = 0.01;
@@ -107,6 +115,7 @@ pub struct Renderer {
     sphere_ibuf: wgpu::Buffer,
     sphere_icount: u32,
 
+    line_quad_vbuf: wgpu::Buffer,
     line_vbuf: wgpu::Buffer,
     line_vcount: u32,
 
@@ -236,6 +245,11 @@ impl Renderer {
         let starfield_sh = shader(&device, "starfield", include_str!("../../assets/shaders/starfield.wgsl"));
         let globe_sh = shader(&device, "globe", include_str!("../../assets/shaders/globe.wgsl"));
         let lines_sh = shader(&device, "lines", include_str!("../../assets/shaders/lines.wgsl"));
+        let thick_lines_sh = shader(
+            &device,
+            "thick_lines",
+            include_str!("../../assets/shaders/thick_lines.wgsl"),
+        );
         let atmo_sh = shader(&device, "atmosphere", include_str!("../../assets/shaders/atmosphere.wgsl"));
         let track_sh = shader(&device, "track", include_str!("../../assets/shaders/track.wgsl"));
         let markers_sh = shader(&device, "markers", include_str!("../../assets/shaders/markers.wgsl"));
@@ -269,6 +283,11 @@ impl Renderer {
             array_stride: std::mem::size_of::<MarkerInstance>() as u64,
             step_mode: wgpu::VertexStepMode::Instance,
             attributes: &ATTRS_MARKER_INST,
+        };
+        let thick_inst_layout = wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<mesh::ThickLineInstance>() as u64,
+            step_mode: wgpu::VertexStepMode::Instance,
+            attributes: &ATTRS_THICK_INST,
         };
 
         let additive = wgpu::BlendState {
@@ -335,16 +354,20 @@ impl Renderer {
             cache: None,
         });
         // Far-hemisphere lines: only where they sit behind the globe surface
-        // (depth Greater), faint and non-depth-writing.
+        // (depth Greater), faint and non-depth-writing. Coastlines/borders are
+        // instanced thick-line quads (one instance per segment), expanded to a
+        // constant pixel width in the vertex shader.
         let lines_back_pipeline = make_pipeline(
-            &device, &pipeline_layout, &lines_sh, format, &[pc_layout.clone()],
-            wgpu::PrimitiveTopology::LineList,
+            &device, &pipeline_layout, &thick_lines_sh, format,
+            &[corner_layout.clone(), thick_inst_layout.clone()],
+            wgpu::PrimitiveTopology::TriangleList,
             Some(wgpu::BlendState::ALPHA_BLENDING), false,
             wgpu::CompareFunction::Greater, "fs_back",
         );
         let lines_pipeline = make_pipeline(
-            &device, &pipeline_layout, &lines_sh, format, &[pc_layout],
-            wgpu::PrimitiveTopology::LineList, None, true,
+            &device, &pipeline_layout, &thick_lines_sh, format,
+            &[corner_layout.clone(), thick_inst_layout],
+            wgpu::PrimitiveTopology::TriangleList, None, true,
             wgpu::CompareFunction::LessEqual, "fs_main",
         );
         let atmosphere_pipeline = make_pipeline(
@@ -453,23 +476,29 @@ impl Renderer {
 
         let coast = crate::data::extract_polylines(COASTLINE_GEOJSON);
         let countries = crate::data::extract_polylines(COUNTRIES_GEOJSON);
-        let mut line_verts: Vec<VertexPC> = Vec::new();
-        // Borders sit a hair below coastlines so coastlines win where they overlap.
-        crate::earth::build_lines(&countries, COLOR_BORDER, 1.0020, &mut line_verts);
-        crate::earth::build_lines(&coast, COLOR_COAST, 1.0030, &mut line_verts);
+        // One thick-line instance per segment. layer 1.0 = border, 0.0 = coast;
+        // borders sit a hair below coastlines so coastlines win where they overlap.
+        let mut line_insts: Vec<mesh::ThickLineInstance> = Vec::new();
+        crate::earth::build_thick_lines(&countries, COLOR_BORDER, 1.0, 1.0020, &mut line_insts);
+        crate::earth::build_thick_lines(&coast, COLOR_COAST, 0.0, 1.0030, &mut line_insts);
         log::info!(
-            "loaded {} coastline + {} country polylines = {} line vertices",
+            "loaded {} coastline + {} country polylines = {} line segments",
             coast.len(),
             countries.len(),
-            line_verts.len()
+            line_insts.len()
         );
 
-        let line_vbuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("line-verts"),
-            contents: bytemuck::cast_slice(&line_verts),
+        let line_quad_vbuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("line-quad"),
+            contents: bytemuck::cast_slice(&mesh::LINE_QUAD),
             usage: wgpu::BufferUsages::VERTEX,
         });
-        let line_vcount = line_verts.len() as u32;
+        let line_vbuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("line-instances"),
+            contents: bytemuck::cast_slice(&line_insts),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+        let line_vcount = line_insts.len() as u32;
 
         // Translucent land fill from the closed country rings, sitting just above
         // the globe surface and below the borders/coastlines.
@@ -580,6 +609,7 @@ impl Renderer {
             sphere_vbuf,
             sphere_ibuf,
             sphere_icount,
+            line_quad_vbuf,
             line_vbuf,
             line_vcount,
             fill_vbuf,
@@ -718,7 +748,8 @@ impl Renderer {
             cam_pos: [eye.x, eye.y, eye.z, 1.0],
             params: [aspect, width, height, 0.0],
             style0: [s.line_back_alpha, s.fill_alpha, s.track_alpha, s.line_brightness],
-            style1: [s.atmo_intensity, 1.0 + s.atmo_thickness, 0.0, 0.0],
+            // z = coastline width px, w = border width px (egui may override).
+            style1: [s.atmo_intensity, 1.0 + s.atmo_thickness, COAST_WIDTH_PX, BORDER_WIDTH_PX],
         };
         self.queue
             .write_buffer(&self.uniform_buf, 0, bytemuck::cast_slice(&[u]));
@@ -893,10 +924,13 @@ impl Renderer {
             let body_count = self.world.bodies.len() as u32;
 
             // --- Far side (behind the globe surface): faint, "through glass" --
-            // Coastlines + borders.
-            rp.set_pipeline(&self.lines_back_pipeline);
-            rp.set_vertex_buffer(0, self.line_vbuf.slice(..));
-            rp.draw(0..self.line_vcount, 0..1);
+            // Coastlines + borders (instanced thick-line quads).
+            if self.line_vcount > 0 {
+                rp.set_pipeline(&self.lines_back_pipeline);
+                rp.set_vertex_buffer(0, self.line_quad_vbuf.slice(..));
+                rp.set_vertex_buffer(1, self.line_vbuf.slice(..));
+                rp.draw(0..6, 0..self.line_vcount);
+            }
 
             // Orbit tracks.
             if self.track_vcount > 0 && self.settings.show_tracks {
@@ -921,10 +955,13 @@ impl Renderer {
                 rp.draw(0..self.fill_vcount, 0..1);
             }
 
-            // Coastlines + borders.
-            rp.set_pipeline(&self.lines_pipeline);
-            rp.set_vertex_buffer(0, self.line_vbuf.slice(..));
-            rp.draw(0..self.line_vcount, 0..1);
+            // Coastlines + borders (instanced thick-line quads).
+            if self.line_vcount > 0 {
+                rp.set_pipeline(&self.lines_pipeline);
+                rp.set_vertex_buffer(0, self.line_quad_vbuf.slice(..));
+                rp.set_vertex_buffer(1, self.line_vbuf.slice(..));
+                rp.draw(0..6, 0..self.line_vcount);
+            }
 
             // Orbit tracks.
             if self.track_vcount > 0 && self.settings.show_tracks {
