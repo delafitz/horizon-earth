@@ -342,6 +342,37 @@ impl Renderer {
         // `world` is supplied by the caller (real tracked objects or the demo
         // constellation).
 
+        // One-time ground-track diagnostic. Reports each body's sub-satellite
+        // point two independent ways: the canonical astrodynamics computation
+        // (ECI -> ECEF via -GMST) and one derived from the *render* pipeline
+        // (eci_to_world + the same GMST spin the globe uses). They must agree
+        // for ground tracks to line up with the drawn geography.
+        if log::log_enabled!(log::Level::Info) {
+            use glam::DMat3;
+            let g = world.earth_rotation();
+            let unix = (world.current().jd - horizon_core::time::UNIX_EPOCH_JD) * 86400.0;
+            log::info!("ground-track check @ unix {unix:.0} (gmst {g:.4} rad):");
+            for (i, b) in world.bodies.iter().enumerate() {
+                let p = world.body_position_eci(i);
+                let r = p.length();
+                if r < 1.0 {
+                    continue; // failed propagation collapses to the origin
+                }
+                let ecef = DMat3::from_rotation_z(-g) * p;
+                let lat_c = (ecef.z / r).asin().to_degrees();
+                let lon_c = ecef.y.atan2(ecef.x).to_degrees();
+                let sat = eci_to_world(p);
+                let er = DMat3::from_rotation_y(-g) * sat;
+                let lat_r = (er.y / er.length()).asin().to_degrees();
+                let lon_r = (-er.z).atan2(er.x).to_degrees();
+                let alt = r - horizon_core::units::EARTH_RADIUS_KM;
+                log::info!(
+                    "  {:<18} sub=({lat_c:6.1},{lon_c:7.1})  render=({lat_r:6.1},{lon_r:7.1})  alt={alt:6.0}km",
+                    b.name
+                );
+            }
+        }
+
         // Static orbit paths (the body slides along them each frame). Sampled in
         // ECI/km over one period, then mapped into the render frame.
         let mut track_verts: Vec<VertexPC> = Vec::new();
