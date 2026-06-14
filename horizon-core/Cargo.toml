@@ -6,3 +6,4 @@ description = "Engine-agnostic simulation core: units, frames, orbits, camera (f
 
 [dependencies]
 glam = "0.29"
+sgp4 = "2.4.0"

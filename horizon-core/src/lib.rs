@@ -18,9 +18,15 @@
 pub mod camera;
 pub mod frames;
 pub mod orbit;
+pub mod time;
 pub mod units;
 pub mod world;
 
 pub use camera::OrbitCamera;
-pub use orbit::KeplerOrbit;
+pub use orbit::{KeplerOrbit, Propagator, Sgp4Orbit};
+pub use time::{gmst, Epoch};
 pub use world::{Body, World};
+
+/// Re-exported so downstream crates (e.g. the data fetcher) can parse TLE/OMM
+/// element sets without depending on the `sgp4` crate directly.
+pub use sgp4::Elements;

@@ -28,3 +28,9 @@ fn vs_main(@location(0) pos: vec3<f32>, @location(1) col: vec3<f32>) -> VOut {
 fn fs_main(in: VOut) -> @location(0) vec4<f32> {
     return vec4<f32>(in.col, 0.35);
 }
+
+// Far side (behind the translucent globe): fainter, seen "through the glass".
+@fragment
+fn fs_back(in: VOut) -> @location(0) vec4<f32> {
+    return vec4<f32>(in.col, 0.14);
+}

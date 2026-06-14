@@ -1,81 +1,112 @@
-//! The simulated world: a clock, the central body's rotation, and the set of
-//! orbiting bodies.
+//! The simulated world: a clock instant, the central body's orientation, and
+//! the set of orbiting bodies.
 //!
-//! The clock is driven from the renderer's real elapsed time scaled by
-//! `time_scale` (orbital periods are minutes-to-hours of real time, far too
-//! slow to watch at 1×). Everything else is derived from the resulting
-//! simulation time, so the model is stateless between frames and deterministic.
+//! The world is told the current [`Epoch`] each frame (the app decides whether
+//! that is wall-clock "now" or accelerated demo time) and everything else is
+//! derived from it — stateless between frames and deterministic.
 
 use glam::DVec3;
 
-use crate::orbit::KeplerOrbit;
-use crate::units::EARTH_ANGULAR_VELOCITY;
+use crate::orbit::{KeplerOrbit, Propagator, Sgp4Orbit};
+use crate::time::{gmst, Epoch};
 
-/// How many simulated seconds pass per real second.
+/// Default simulated-seconds-per-real-second for demo mode.
 pub const DEFAULT_TIME_SCALE: f64 = 500.0;
 
+/// Nord aurora palette, cycled across tracked bodies.
+const PALETTE: [[f32; 3]; 5] = [
+    [0.749, 0.380, 0.416], // Nord11
+    [0.816, 0.529, 0.439], // Nord12
+    [0.922, 0.796, 0.545], // Nord13
+    [0.639, 0.745, 0.549], // Nord14
+    [0.706, 0.557, 0.678], // Nord15
+];
+
 /// An orbiting body (satellite, station, …).
-#[derive(Clone)]
 pub struct Body {
-    pub name: &'static str,
-    pub orbit: KeplerOrbit,
+    pub name: String,
     /// Render colour (linear RGB).
     pub color: [f32; 3],
+    pub motion: Box<dyn Propagator + Send + Sync>,
 }
 
 pub struct World {
     pub bodies: Vec<Body>,
-    pub time_scale: f64,
-    /// Simulated seconds since epoch (t = 0 at startup).
-    sim_seconds: f64,
+    current: Epoch,
 }
 
 impl World {
-    /// A small demo constellation spanning real altitude regimes (LEO → MEO),
-    /// so the scene shows true relative scale and period.
-    pub fn demo() -> Self {
+    pub fn new(epoch0: Epoch, bodies: Vec<Body>) -> Self {
+        Self { bodies, current: epoch0 }
+    }
+
+    /// A small synthetic constellation spanning real altitude regimes
+    /// (LEO → MEO), referenced to `epoch0`.
+    pub fn demo(epoch0: Epoch) -> Self {
         let deg = |x: f64| x.to_radians();
+        let body = |name: &str, color, orbit| Body {
+            name: name.to_string(),
+            color,
+            motion: Box::new(orbit) as Box<dyn Propagator + Send + Sync>,
+        };
         let bodies = vec![
-            Body {
-                name: "ISS",
-                orbit: KeplerOrbit::circular(420.0, deg(51.6), deg(40.0), 0.0),
-                color: [0.749, 0.380, 0.416], // Nord11
-            },
-            Body {
-                name: "Polar LEO",
-                orbit: KeplerOrbit::circular(800.0, deg(98.0), deg(120.0), 1.5),
-                color: [0.922, 0.796, 0.545], // Nord13
-            },
-            Body {
-                name: "GPS (MEO)",
-                orbit: KeplerOrbit::circular(20_180.0, deg(55.0), deg(200.0), 3.0),
-                color: [0.639, 0.745, 0.549], // Nord14
-            },
+            body(
+                "ISS",
+                [0.749, 0.380, 0.416], // Nord11
+                KeplerOrbit::circular(epoch0, 420.0, deg(51.6), deg(40.0), 0.0),
+            ),
+            body(
+                "Polar LEO",
+                [0.922, 0.796, 0.545], // Nord13
+                KeplerOrbit::circular(epoch0, 800.0, deg(98.0), deg(120.0), 1.5),
+            ),
+            body(
+                "GPS (MEO)",
+                [0.639, 0.745, 0.549], // Nord14
+                KeplerOrbit::circular(epoch0, 20_180.0, deg(55.0), deg(200.0), 3.0),
+            ),
         ];
-        Self {
-            bodies,
-            time_scale: DEFAULT_TIME_SCALE,
-            sim_seconds: 0.0,
-        }
+        Self::new(epoch0, bodies)
     }
 
-    /// Set the simulation time from the renderer's real elapsed seconds.
-    pub fn set_real_elapsed(&mut self, real_seconds: f64) {
-        self.sim_seconds = real_seconds * self.time_scale;
+    /// Set the current simulation instant.
+    pub fn set_time(&mut self, at: Epoch) {
+        self.current = at;
     }
 
-    /// Current simulation time (seconds since epoch).
-    pub fn sim_seconds(&self) -> f64 {
-        self.sim_seconds
+    pub fn current(&self) -> Epoch {
+        self.current
     }
 
-    /// Earth's accumulated rotation angle (rad) about the polar axis.
+    /// Earth's rotation angle (rad) about the polar axis = GMST(now). This is
+    /// the rotation that carries the Earth-fixed frame into the inertial frame.
     pub fn earth_rotation(&self) -> f64 {
-        EARTH_ANGULAR_VELOCITY * self.sim_seconds
+        gmst(self.current)
     }
 
     /// Current ECI position (km) of body `i`.
     pub fn body_position_eci(&self, i: usize) -> DVec3 {
-        self.bodies[i].orbit.position_eci(self.sim_seconds)
+        self.bodies[i].motion.position_eci(self.current)
     }
+}
+
+/// Build bodies from real TLE/OMM element sets, propagated with SGP4. Element
+/// sets that fail to initialise are skipped; colours cycle the Nord palette.
+pub fn bodies_from_elements(elements: &[crate::Elements]) -> Vec<Body> {
+    elements
+        .iter()
+        .enumerate()
+        .filter_map(|(i, el)| {
+            let motion = Sgp4Orbit::from_elements(el).ok()?;
+            let name = el
+                .object_name
+                .clone()
+                .unwrap_or_else(|| format!("NORAD {}", el.norad_id));
+            Some(Body {
+                name,
+                color: PALETTE[i % PALETTE.len()],
+                motion: Box::new(motion),
+            })
+        })
+        .collect()
 }

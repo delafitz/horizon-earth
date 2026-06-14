@@ -50,3 +50,14 @@ fn fs_main(in: VOut) -> @location(0) vec4<f32> {
     let core = 0.6 + 0.4 * smoothstep(0.5, 0.0, d);
     return vec4<f32>(in.color * core, a);
 }
+
+// Far side (behind the translucent globe): dimmer, seen "through the glass".
+@fragment
+fn fs_back(in: VOut) -> @location(0) vec4<f32> {
+    let d = length(in.uv);
+    if (d > 1.0) {
+        discard;
+    }
+    let a = smoothstep(1.0, 0.55, d) * 0.4;
+    return vec4<f32>(in.color * 0.7, a);
+}

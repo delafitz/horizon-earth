@@ -15,14 +15,16 @@ Wayland desktops: clean vector graphics over photorealism.
 and country borders projected onto the sphere, atmospheric glow, starfield
 background, Nord palette, vsync-locked render loop, exit-on-activity.
 
-**In progress — world model & interaction.** Translucent globe with darker
-far-side lines; orbit camera (mouse drag + zoom); an engine-agnostic `f64`
-simulation core (`horizon-core`) with a sim clock, ECI/render frames, and
-Keplerian two-body satellite motion at real altitudes/periods, rendered as
-markers + orbit tracks.
+**In progress — world model & interaction.** Glass globe (everything shows
+through: far-side coastlines, orbit tracks, satellites, stars); orbit camera
+(mouse drag + zoom); an engine-agnostic `f64` simulation core (`horizon-core`)
+with real UTC epochs, GMST-driven Earth orientation, ECI/render frames, and a
+`Propagator` abstraction with both Keplerian two-body and **SGP4** motion. Real
+tracked objects come from CelesTrak via `horizon-data` (cached, offline-capable),
+with **live** (true current positions) and **demo** (accelerated) time modes.
 
-Upcoming: real epochs + GMST so ground tracks align to geography; SGP4 from
-CelesTrak TLEs; cities/labels (HUD); screensaver integration (Phase 5).
+Upcoming: cities/labels and a HUD; selection/info on bodies; screensaver
+integration (Phase 5, `wlr-layer-shell`).
 
 ## Tech stack
 
@@ -32,8 +34,9 @@ CelesTrak TLEs; cities/labels (HUD); screensaver integration (Phase 5).
 | Windowing  | **winit**       | See decision below |
 | Rendering  | wgpu (Metal/Vulkan) | |
 | Geo data   | Natural Earth   | `ne_110m` coastline + admin-0 countries, embedded |
-| Sim core   | `horizon-core`  | f64, units in km/s, ECI frame; render-agnostic |
-| Orbits     | Keplerian two-body | SGP4 + CelesTrak TLE planned |
+| Sim core   | `horizon-core`  | f64, units in km/s, ECI frame + GMST; render-agnostic |
+| Orbits     | Keplerian + SGP4 (`sgp4`) | via a `Propagator` trait |
+| Sat data   | `horizon-data`  | CelesTrak TLE/OMM fetch + cache (`ureq`) |
 
 ### Windowing: winit, not GTK4
 
@@ -63,9 +66,15 @@ Each flag has an equivalent environment variable; either one enables it
 |-------------------|-----------------------|--------|
 | `-w, --windowed`  | `HORIZON_WINDOWED=1`  | Run in a 1280×800 window instead of fullscreen |
 | `-n, --no-exit`   | `HORIZON_NO_EXIT=1`   | Don't quit on input — enables the orbit camera (Escape still quits) |
+| `-d, --demo`      | `HORIZON_DEMO=1`      | Accelerated demo time instead of live wall-clock positions |
+| `--group NAME`    | `HORIZON_GROUP=NAME`  | CelesTrak group to track (default `stations`; e.g. `gps-ops`, `starlink`, `visual`) |
+| `--offline`       | `HORIZON_OFFLINE=1`   | Skip the network; use cached TLEs (or the demo constellation) |
 | `-v, --verbose`   | `RUST_LOG=info`       | Verbose logging (default is `warn`) |
 
-In interactive mode (`--no-exit`), left-drag orbits the camera and scroll zooms.
+In interactive mode (`--no-exit`), left-drag orbits the camera, scroll zooms,
+and **T** toggles live/demo time. Real satellites are fetched from CelesTrak and
+cached under `cache/`; if the fetch fails the app falls back to a synthetic
+constellation.
 
 ```sh
 cargo run -- --windowed --no-exit
@@ -78,14 +87,16 @@ HORIZON_WINDOWED=1 HORIZON_NO_EXIT=1 cargo run
 A Cargo workspace splits the engine-agnostic model from the renderer:
 
 ```
-horizon-core/        simulation core — pure f64, no rendering/windowing deps
+horizon-core/        simulation core — f64, no rendering/windowing/network deps
   src/
     units.rs         physical constants (km, s, GM, Earth rotation rate)
-    frames.rs        ECI <-> render-frame bridge; lat/lon -> ECEF
-    orbit.rs         Keplerian two-body propagation + orbit-track sampling
+    time.rs          UTC epoch (Julian Date) + GMST
+    frames.rs        ECI <-> render-frame bridge; lat/lon -> ECEF/render
+    orbit.rs         Propagator trait; Keplerian two-body + SGP4 propagators
     camera.rs        orbit (arcball) camera: target/distance/yaw/pitch -> view
-    world.rs         sim clock + central-body rotation + orbiting bodies
-src/                 the app (depends on horizon-core)
+    world.rs         current epoch + GMST rotation + bodies (demo + from TLEs)
+horizon-data/        CelesTrak TLE/OMM fetch + on-disk cache (the network side)
+src/                 the app (depends on horizon-core + horizon-data)
   main.rs            entry point, CLI/env options, event loop setup
   app.rs             winit ApplicationHandler: window, input, camera control
   data/              minimal GeoJSON coordinate reader
@@ -136,7 +147,7 @@ The glow is driven by the view ray's closest approach to the globe centre (the
 
 | Knob | Effect |
 |------|--------|
-| alpha `0.45` in the returned colour | Surface transparency. |
+| alpha `0.35` in the returned colour | Surface transparency (glass globe). |
 | `0.30 + 0.70 * d` | Ambient / diffuse lighting balance. |
 | `base` colour | Globe fill (Nord1). |
 
@@ -147,16 +158,21 @@ The glow is driven by the view ray's closest approach to the globe centre (the
 | `COLOR_COAST`, `COLOR_BORDER` | `src/renderer/mod.rs` | Line colours. |
 | `1.0020` / `1.0030` in `build_lines(...)` | `src/renderer/mod.rs` | Border / coastline height above the surface (coastlines win overlaps). |
 | alpha `0.28` in `fs_back` | `assets/shaders/lines.wgsl` | Faintness of far-side (behind-globe) lines. |
+| alpha `0.14` in `fs_back` | `assets/shaders/track.wgsl` | Faintness of far-side orbit tracks. |
+| `×0.4` in `fs_back` | `assets/shaders/markers.wgsl` | Faintness of satellites behind the globe. |
 
 ### Orbiting bodies & tracks
 
 | Knob | Where | Effect |
 |------|-------|--------|
-| `World::demo()` bodies | `horizon-core/src/world.rs` | Per body: name, `KeplerOrbit` (altitude/inclination/node/phase), colour. |
-| `DEFAULT_TIME_SCALE` | `horizon-core/src/world.rs` | Simulated seconds per real second (orbital speed). |
+| `--group` / `HORIZON_GROUP` | CLI / env | Which CelesTrak group of real objects to track. |
+| `TLE_MAX_AGE` | `src/app.rs` | How long a cached TLE set stays fresh before re-fetch. |
+| `World::demo()` bodies | `horizon-core/src/world.rs` | Synthetic-fallback bodies: name, `KeplerOrbit`, colour. |
+| `PALETTE` | `horizon-core/src/world.rs` | Colours cycled across tracked bodies. |
+| `DEFAULT_TIME_SCALE` | `horizon-core/src/world.rs` | Demo-mode simulated seconds per real second. |
 | orbital elements / `circular(...)` | `horizon-core/src/orbit.rs` | Semi-major axis, eccentricity, inclination, RAAN, arg. periapsis, mean anomaly. |
 | `MARKER_SIZE` | `src/renderer/mod.rs` | On-screen marker size (NDC). |
-| `body.orbit.sample_track(128)` | `src/renderer/mod.rs` | Orbit-track smoothness (segment count). |
+| `sample_track(.., 128)` | `src/renderer/mod.rs` | Orbit-track smoothness (segment count). |
 | alpha `0.35` in `fs_main` | `assets/shaders/track.wgsl` | Orbit-track faintness. |
 | `smoothstep` / `core` | `assets/shaders/markers.wgsl` | Marker dot softness and core brightness. |
 

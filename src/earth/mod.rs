@@ -1,28 +1,20 @@
-//! Geographic projection: latitude/longitude onto a unit sphere, and
-//! conversion of GeoJSON polylines into renderable line segments.
+//! Geographic projection: latitude/longitude onto the sphere, and conversion
+//! of GeoJSON polylines into renderable line segments.
+//!
+//! Projection lives in `horizon_core::frames`: lon/lat -> ECEF -> render frame.
+//! The geometry is built in the Earth-fixed orientation (GMST = 0); the
+//! renderer applies the GMST spin as a model rotation, which is what keeps
+//! coastlines aligned with the inertial-frame satellites.
+
+use horizon_core::frames::geo_to_render;
 
 use crate::data::PolyLine;
 use crate::renderer::mesh::VertexPC;
 
-/// Convert geographic coordinates (degrees) to Cartesian coordinates on a
-/// sphere of the given radius.
-///
-/// Matches the convention in the project spec:
-///   x = r * cos(lat) * cos(lon)
-///   y = r * sin(lat)
-///   z = r * cos(lat) * sin(lon)
-///
-/// North pole at +Y, longitude 0 at +X. Longitude is negated so the globe
-/// reads correctly when viewed from outside (east to the right as a meridian
-/// faces the camera); without this the continents come out mirrored.
+/// Convert geographic coordinates (degrees) to render-frame coordinates at the
+/// given render radius (Earth surface = 1.0).
 pub fn latlon_to_xyz(lon_deg: f64, lat_deg: f64, radius: f32) -> [f32; 3] {
-    let lat = lat_deg.to_radians();
-    let lon = (-lon_deg).to_radians();
-    let cl = lat.cos();
-    let x = radius as f64 * cl * lon.cos();
-    let y = radius as f64 * lat.sin();
-    let z = radius as f64 * cl * lon.sin();
-    [x as f32, y as f32, z as f32]
+    geo_to_render(lon_deg, lat_deg, radius as f64).as_vec3().to_array()
 }
 
 /// Append every polyline to `out` as a list of GPU line segments (LineList

@@ -30,3 +30,13 @@ pub fn latlon_to_ecef(lon_deg: f64, lat_deg: f64, radius_km: f64) -> DVec3 {
     let cl = lat.cos();
     DVec3::new(radius_km * cl * lon.cos(), radius_km * cl * lon.sin(), radius_km * lat.sin())
 }
+
+/// Geodetic longitude/latitude (degrees) to a position in the render frame at
+/// `render_radius` (Earth surface = 1.0), in the **Earth-fixed** orientation
+/// (GMST = 0). The renderer applies the GMST spin as a model rotation so this
+/// geometry can be built once. Replaces the old ad-hoc longitude negation:
+/// the ECEF→render bridge produces the correct (non-mirrored) handedness.
+#[inline]
+pub fn geo_to_render(lon_deg: f64, lat_deg: f64, render_radius: f64) -> DVec3 {
+    eci_to_world(latlon_to_ecef(lon_deg, lat_deg, render_radius * EARTH_RADIUS_KM))
+}

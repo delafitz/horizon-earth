@@ -1,0 +1,11 @@
+[package]
+name = "horizon-data"
+version = "0.1.0"
+edition = "2021"
+description = "TLE/OMM element fetching and caching (CelesTrak). The network side, kept out of horizon-core."
+
+[dependencies]
+horizon-core = { path = "../horizon-core" }
+ureq = "2"
+serde_json = "1"
+log = "0.4"

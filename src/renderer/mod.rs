@@ -10,7 +10,8 @@ use wgpu::util::DeviceExt;
 use winit::window::Window;
 
 use horizon_core::frames::eci_to_world;
-use horizon_core::{OrbitCamera, World};
+use horizon_core::orbit::sample_track;
+use horizon_core::{Epoch, OrbitCamera, World};
 use mesh::{MarkerInstance, VertexPC, VertexPN};
 
 // Natural Earth vector data, embedded so the binary is self-contained.
@@ -67,7 +68,9 @@ pub struct Renderer {
     lines_back_pipeline: wgpu::RenderPipeline,
     lines_pipeline: wgpu::RenderPipeline,
     atmosphere_pipeline: wgpu::RenderPipeline,
+    track_back_pipeline: wgpu::RenderPipeline,
     track_pipeline: wgpu::RenderPipeline,
+    markers_back_pipeline: wgpu::RenderPipeline,
     markers_pipeline: wgpu::RenderPipeline,
 
     sphere_vbuf: wgpu::Buffer,
@@ -88,7 +91,7 @@ pub struct Renderer {
 }
 
 impl Renderer {
-    pub async fn new(window: Arc<Window>) -> Renderer {
+    pub async fn new(window: Arc<Window>, world: World) -> Renderer {
         let size = window.inner_size();
         let width = size.width.max(1);
         let height = size.height.max(1);
@@ -270,7 +273,15 @@ impl Renderer {
             wgpu::PrimitiveTopology::TriangleList, Some(additive), false,
             wgpu::CompareFunction::LessEqual, "fs_main",
         );
-        // Orbit tracks: inertial-frame line loops, faint and non-depth-writing.
+        // Orbit tracks and body markers each get a near pass (depth LessEqual,
+        // full) and a far pass (depth Greater, faint) so whatever sits behind
+        // the translucent globe still shows through "the glass".
+        let track_back_pipeline = make_pipeline(
+            &device, &pipeline_layout, &track_sh, format, &[track_layout.clone()],
+            wgpu::PrimitiveTopology::LineList,
+            Some(wgpu::BlendState::ALPHA_BLENDING), false,
+            wgpu::CompareFunction::Greater, "fs_back",
+        );
         let track_pipeline = make_pipeline(
             &device, &pipeline_layout, &track_sh, format, &[track_layout],
             wgpu::PrimitiveTopology::LineList,
@@ -278,6 +289,13 @@ impl Renderer {
             wgpu::CompareFunction::LessEqual, "fs_main",
         );
         // Body markers: instanced billboards (quad buffer + instance buffer).
+        let markers_back_pipeline = make_pipeline(
+            &device, &pipeline_layout, &markers_sh, format,
+            &[corner_layout.clone(), inst_layout.clone()],
+            wgpu::PrimitiveTopology::TriangleList,
+            Some(wgpu::BlendState::ALPHA_BLENDING), false,
+            wgpu::CompareFunction::Greater, "fs_back",
+        );
         let markers_pipeline = make_pipeline(
             &device, &pipeline_layout, &markers_sh, format, &[corner_layout, inst_layout],
             wgpu::PrimitiveTopology::TriangleList,
@@ -321,14 +339,15 @@ impl Renderer {
 
         // --- Orbiting bodies -------------------------------------------------
         let camera = OrbitCamera::default();
-        let world = World::demo();
+        // `world` is supplied by the caller (real tracked objects or the demo
+        // constellation).
 
-        // Static orbit paths (the body slides along them each frame). The orbit
-        // is computed in ECI/km, then mapped into the render frame.
+        // Static orbit paths (the body slides along them each frame). Sampled in
+        // ECI/km over one period, then mapped into the render frame.
         let mut track_verts: Vec<VertexPC> = Vec::new();
         for body in &world.bodies {
             let col = [body.color[0] * 0.85, body.color[1] * 0.85, body.color[2] * 0.85];
-            let pts = body.orbit.sample_track(128);
+            let pts = sample_track(body.motion.as_ref(), 128);
             for w in pts.windows(2) {
                 let a = eci_to_world(w[0]).as_vec3().to_array();
                 let b = eci_to_world(w[1]).as_vec3().to_array();
@@ -369,7 +388,9 @@ impl Renderer {
             lines_back_pipeline,
             lines_pipeline,
             atmosphere_pipeline,
+            track_back_pipeline,
             track_pipeline,
+            markers_back_pipeline,
             markers_pipeline,
             sphere_vbuf,
             sphere_ibuf,
@@ -405,16 +426,15 @@ impl Renderer {
         self.camera.zoom(factor as f64);
     }
 
-    /// Advance the world clock and refresh per-frame GPU state for the given
-    /// real elapsed time (seconds).
-    pub fn update(&mut self, time: f32) {
-        self.world.set_real_elapsed(time as f64);
+    /// Set the world to time `now` and refresh per-frame GPU state.
+    pub fn update(&mut self, now: Epoch) {
+        self.world.set_time(now);
 
         let aspect = self.config.width as f32 / self.config.height.max(1) as f32;
         let view_proj = self.camera.view_proj(aspect as f64).as_mat4();
         let eye = self.camera.eye().as_vec3();
-        // The Earth spins on its polar axis by the simulated rotation angle;
-        // bodies live in the inertial frame and are not multiplied by `model`.
+        // The Earth's orientation is GMST(now): the rotation carrying the
+        // Earth-fixed coastlines into the inertial frame the satellites live in.
         let spin = self.world.earth_rotation().rem_euclid(std::f64::consts::TAU) as f32;
         let model = Mat4::from_rotation_y(spin);
 
@@ -487,17 +507,36 @@ impl Renderer {
             rp.set_index_buffer(self.sphere_ibuf.slice(..), wgpu::IndexFormat::Uint32);
             rp.draw_indexed(0..self.sphere_icount, 0, 0..1);
 
-            // Far-side coastlines + borders, faint (behind the globe surface).
+            let body_count = self.world.bodies.len() as u32;
+
+            // --- Far side (behind the globe surface): faint, "through glass" --
+            // Coastlines + borders.
             rp.set_pipeline(&self.lines_back_pipeline);
             rp.set_vertex_buffer(0, self.line_vbuf.slice(..));
             rp.draw(0..self.line_vcount, 0..1);
 
-            // Near-side coastlines + borders.
+            // Orbit tracks.
+            if self.track_vcount > 0 {
+                rp.set_pipeline(&self.track_back_pipeline);
+                rp.set_vertex_buffer(0, self.track_vbuf.slice(..));
+                rp.draw(0..self.track_vcount, 0..1);
+            }
+
+            // Bodies behind the globe.
+            if body_count > 0 {
+                rp.set_pipeline(&self.markers_back_pipeline);
+                rp.set_vertex_buffer(0, self.marker_quad_vbuf.slice(..));
+                rp.set_vertex_buffer(1, self.marker_inst_buf.slice(..));
+                rp.draw(0..6, 0..body_count);
+            }
+
+            // --- Near side: full intensity -----------------------------------
+            // Coastlines + borders.
             rp.set_pipeline(&self.lines_pipeline);
             rp.set_vertex_buffer(0, self.line_vbuf.slice(..));
             rp.draw(0..self.line_vcount, 0..1);
 
-            // Orbit tracks (inertial frame).
+            // Orbit tracks.
             if self.track_vcount > 0 {
                 rp.set_pipeline(&self.track_pipeline);
                 rp.set_vertex_buffer(0, self.track_vbuf.slice(..));
@@ -510,9 +549,7 @@ impl Renderer {
             rp.set_index_buffer(self.sphere_ibuf.slice(..), wgpu::IndexFormat::Uint32);
             rp.draw_indexed(0..self.sphere_icount, 0, 0..1);
 
-            // Orbiting bodies (instanced billboards), drawn last so they read
-            // crisply; still depth-tested so bodies behind the globe are hidden.
-            let body_count = self.world.bodies.len() as u32;
+            // Bodies in front, drawn last so they read crisply.
             if body_count > 0 {
                 rp.set_pipeline(&self.markers_pipeline);
                 rp.set_vertex_buffer(0, self.marker_quad_vbuf.slice(..));

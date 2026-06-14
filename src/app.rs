@@ -5,9 +5,12 @@
 //!   HORIZON_WINDOWED=1  -> run in a 1280x800 window instead of fullscreen
 //!   HORIZON_NO_EXIT=1   -> don't quit on input (Escape still quits)
 
+use std::path::Path;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use horizon_core::world::{bodies_from_elements, DEFAULT_TIME_SCALE};
+use horizon_core::{Epoch, World};
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::ActiveEventLoop;
@@ -16,10 +19,35 @@ use winit::window::{Fullscreen, Window, WindowId};
 
 use crate::renderer::Renderer;
 
+/// How the simulation clock advances.
+#[derive(Clone, Copy, PartialEq)]
+pub enum TimeMode {
+    /// Real wall-clock time — bodies sit at their true current positions.
+    Live,
+    /// Accelerated from startup, for lively eye-candy.
+    Demo,
+}
+
+/// Wall-clock UTC "now" as an [`Epoch`].
+fn now_epoch() -> Epoch {
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0);
+    Epoch::from_unix_seconds(secs)
+}
+
+/// How long a cached TLE set is considered fresh.
+const TLE_MAX_AGE: Duration = Duration::from_secs(6 * 3600);
+
 pub struct App {
     window: Option<Arc<Window>>,
     renderer: Option<Renderer>,
     start: Instant,
+    epoch0: Epoch,
+    time_mode: TimeMode,
+    group: String,
+    offline: bool,
     last_cursor: Option<(f64, f64)>,
     dragging: bool,
     no_exit: bool,
@@ -27,16 +55,53 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(windowed: bool, no_exit: bool) -> Self {
+    pub fn new(windowed: bool, no_exit: bool, demo: bool, group: String, offline: bool) -> Self {
         Self {
             window: None,
             renderer: None,
             start: Instant::now(),
+            epoch0: now_epoch(),
+            time_mode: if demo { TimeMode::Demo } else { TimeMode::Live },
+            group,
+            offline,
             last_cursor: None,
             dragging: false,
             no_exit,
             windowed,
         }
+    }
+
+    /// The simulation instant to render this frame.
+    fn current_epoch(&self) -> Epoch {
+        match self.time_mode {
+            TimeMode::Live => now_epoch(),
+            TimeMode::Demo => self
+                .epoch0
+                .plus_seconds(self.start.elapsed().as_secs_f64() * DEFAULT_TIME_SCALE),
+        }
+    }
+
+    /// Build the world: real tracked objects (CelesTrak group), falling back to
+    /// the synthetic demo constellation if offline or the fetch yields nothing.
+    fn build_world(&self) -> World {
+        let cache = Path::new("cache");
+        let loaded = if self.offline {
+            horizon_data::load_cached(&self.group, cache)
+        } else {
+            horizon_data::load_group(&self.group, cache, TLE_MAX_AGE)
+        };
+        match loaded {
+            Ok(els) => {
+                let bodies = bodies_from_elements(&els);
+                if !bodies.is_empty() {
+                    log::info!("tracking {} objects from '{}'", bodies.len(), self.group);
+                    return World::new(self.epoch0, bodies);
+                }
+                log::warn!("group '{}' produced no usable bodies; using demo", self.group);
+            }
+            Err(e) => log::warn!("TLE load failed ({e}); using demo constellation"),
+        }
+        World::demo(self.epoch0)
     }
 }
 
@@ -61,9 +126,11 @@ impl ApplicationHandler for App {
         // Hide the cursor in screensaver mode.
         window.set_cursor_visible(self.windowed);
 
-        let renderer = pollster::block_on(Renderer::new(window.clone()));
-
         self.start = Instant::now();
+        self.epoch0 = now_epoch();
+        let world = self.build_world();
+        let renderer = pollster::block_on(Renderer::new(window.clone(), world));
+
         self.last_cursor = None;
         self.window = Some(window);
         self.renderer = Some(renderer);
@@ -83,6 +150,19 @@ impl ApplicationHandler for App {
                     let escape = matches!(event.logical_key, Key::Named(NamedKey::Escape));
                     if escape || !self.no_exit {
                         event_loop.exit();
+                        return;
+                    }
+                    // Interactive-only shortcuts. 'T' toggles live/demo time.
+                    if let Key::Character(s) = &event.logical_key {
+                        if s.eq_ignore_ascii_case("t") {
+                            self.time_mode = match self.time_mode {
+                                TimeMode::Live => TimeMode::Demo,
+                                TimeMode::Demo => TimeMode::Live,
+                            };
+                            // Re-baseline so the demo clock doesn't jump.
+                            self.start = Instant::now();
+                            self.epoch0 = now_epoch();
+                        }
                     }
                 }
             }
@@ -142,9 +222,9 @@ impl ApplicationHandler for App {
             }
 
             WindowEvent::RedrawRequested => {
-                let t = self.start.elapsed().as_secs_f32();
+                let now = self.current_epoch();
                 if let (Some(r), Some(w)) = (self.renderer.as_mut(), self.window.as_ref()) {
-                    r.update(t);
+                    r.update(now);
                     match r.render() {
                         Ok(()) => {}
                         Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
