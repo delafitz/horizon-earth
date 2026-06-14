@@ -37,6 +37,11 @@ const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 const COLOR_COAST: [f32; 3] = [0.533, 0.753, 0.816]; // Nord8 #88C0D0
 const COLOR_BORDER: [f32; 3] = [0.298, 0.337, 0.416]; // Nord3 #4C566A
 const COLOR_LAND: [f32; 3] = [0.263, 0.298, 0.369]; // Nord3-ish land fill (low alpha)
+// Land-fill curvature tolerance: the max angle (degrees) a fill triangle edge
+// may span before it's subdivided and snapped to the sphere. Smaller = smoother
+// fill that hugs the curve (more triangles), larger = flatter/cheaper. ~2° keeps
+// the sag well under a kilometre, invisible even in fly mode.
+const FILL_SUBDIV_TOLERANCE_DEG: f64 = 2.0;
 const COLOR_BG: wgpu::Color = wgpu::Color {
     r: 0.180,
     g: 0.204,
@@ -58,15 +63,9 @@ const ATTRS_THICK_INST: [wgpu::VertexAttribute; 3] =
     wgpu::vertex_attr_array![1 => Float32x3, 2 => Float32x3, 3 => Float32x4];
 
 // Ground anchors: nadir drop-lines + footprint rings, reusing the thick-line
-// instance/shader. Width/alpha live in style2.x / style2.y so the egui panel can
-// drive them later. The footprint is the physical horizon circle (angular radius
+// instance/shader. Width/alpha/far-side opacity are now egui-driven (style2.x/y
+// and style2.z). The footprint is the physical horizon circle (angular radius
 // from altitude); `RING_SEGMENTS` points per ring.
-const GROUND_WIDTH_PX: f32 = 1.5;
-const GROUND_ALPHA: f32 = 0.5;
-// Far-side (behind-globe) alpha multiplier shared by the satellite-related
-// layers — orbit tracks, markers and ground anchors — seen "through the glass".
-// Lives in style2.z so the egui panel can bind one transparency slider to it.
-const FAR_SAT_ALPHA: f32 = 0.4;
 const RING_SEGMENTS: usize = 48;
 // Surface radius for ground geometry: just above the globe and land fill.
 const GROUND_RADIUS: f32 = 1.0015;
@@ -542,7 +541,13 @@ impl Renderer {
         // the globe surface and below the borders/coastlines.
         let rings = crate::data::extract_polygon_rings(COUNTRIES_GEOJSON);
         let mut fill_verts: Vec<VertexPC> = Vec::new();
-        crate::earth::build_fill(&rings, COLOR_LAND, 1.0010, &mut fill_verts);
+        crate::earth::build_fill(
+            &rings,
+            COLOR_LAND,
+            1.0010,
+            FILL_SUBDIV_TOLERANCE_DEG.to_radians(),
+            &mut fill_verts,
+        );
         log::info!("triangulated {} land rings = {} fill vertices", rings.len(), fill_verts.len());
         let fill_vbuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("fill-verts"),
@@ -822,7 +827,7 @@ impl Renderer {
                 s.coast_width_px(),
                 s.border_width_px(),
             ],
-            style2: [GROUND_WIDTH_PX, GROUND_ALPHA, FAR_SAT_ALPHA, 0.0],
+            style2: [s.ground_width_px(), s.ground_alpha, s.sat_back_alpha, 0.0],
         };
         self.queue
             .write_buffer(&self.uniform_buf, 0, bytemuck::cast_slice(&[u]));

@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use horizon_core::world::{bodies_from_elements, DEFAULT_TIME_SCALE};
-use horizon_core::{Epoch, World};
+use horizon_core::{Category, Epoch, World};
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::ActiveEventLoop;
@@ -41,28 +41,19 @@ fn now_epoch() -> Epoch {
 /// How long a cached TLE set is considered fresh.
 const TLE_MAX_AGE: Duration = Duration::from_secs(6 * 3600);
 
-/// Randomly choose `n` distinct elements of `els`, seeded from the wall clock so
-/// each call differs. Assumes `n < els.len()` (the caller checks); picks indices
-/// via a partial Fisher–Yates over an index array and clones the chosen sets.
-fn sample_elements(els: &[horizon_core::Elements], n: usize) -> Vec<horizon_core::Elements> {
-    // xorshift64* — tiny, dependency-free; seed must be non-zero.
-    let mut state = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0)
-        | 1;
-    let mut next = move || {
-        state ^= state >> 12;
-        state ^= state << 25;
-        state ^= state >> 27;
-        state.wrapping_mul(0x2545F4914F6CDD1D)
-    };
-    let mut idx: Vec<usize> = (0..els.len()).collect();
-    for i in 0..n {
-        let j = i + (next() as usize) % (els.len() - i);
-        idx.swap(i, j);
-    }
-    idx[..n].iter().map(|&k| els[k].clone()).collect()
+/// Classify every element once (building a propagator per set, for the orbital
+/// period), so the per-type sampler can bucket without rebuilding propagators on
+/// every re-sample. Elements that fail to initialise classify to `None`.
+fn classify_elements(els: &[horizon_core::Elements]) -> Vec<Option<Category>> {
+    use horizon_core::{Propagator, Sgp4Orbit};
+    els.iter()
+        .map(|el| {
+            Sgp4Orbit::from_elements(el).ok().map(|m| {
+                let name = el.object_name.as_deref().unwrap_or("");
+                Category::classify(name, m.period())
+            })
+        })
+        .collect()
 }
 
 pub struct App {
@@ -75,9 +66,12 @@ pub struct App {
     offline: bool,
     /// If set, the initial random-subset size shown from the group.
     sample: Option<usize>,
-    /// All element sets loaded for the group; re-sampled when the panel slider
-    /// changes the shown count.
+    /// All element sets loaded for the group; re-sampled (per type) when a
+    /// panel slider changes a type's shown count.
     elements: Vec<horizon_core::Elements>,
+    /// Category of each element in `elements` (classified once at load), so the
+    /// per-type sampler can bucket without rebuilding every propagator.
+    element_cats: Vec<Option<Category>>,
     last_cursor: Option<(f64, f64)>,
     dragging: bool,
     no_exit: bool,
@@ -111,6 +105,7 @@ impl App {
             offline,
             sample,
             elements: Vec::new(),
+            element_cats: Vec::new(),
             last_cursor: None,
             dragging: false,
             no_exit,
@@ -151,26 +146,59 @@ impl App {
         }
     }
 
-    /// Build the world from a random `n`-object sample of the loaded elements
-    /// (all of them when `n >= total`), falling back to the demo constellation
-    /// when nothing usable is available.
-    fn world_from_count(&self, n: usize) -> World {
+    /// Per-type "max shown" caps, indexed parallel to [`crate::ui::CATEGORIES`].
+    fn type_caps(&self) -> Vec<usize> {
+        self.ui.settings.types.iter().map(|t| t.max_shown).collect()
+    }
+
+    /// Build the world by sampling each category down to its cap: for every
+    /// [`crate::ui::CATEGORIES`] entry, take a random `min(available, cap)`
+    /// subset of that type's elements. Falls back to the demo constellation when
+    /// nothing usable results.
+    fn world_from_caps(&self, caps: &[usize]) -> World {
         if self.elements.is_empty() {
             return World::demo(self.epoch0);
         }
-        let els = if n < self.elements.len() {
-            let s = sample_elements(&self.elements, n);
-            log::info!("sampled {} of {} '{}' objects", s.len(), self.elements.len(), self.group);
-            s
-        } else {
-            self.elements.clone()
+        // One xorshift64* RNG for the whole selection (seeded from the clock).
+        let mut state = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0)
+            | 1;
+        let mut rng = move || {
+            state ^= state >> 12;
+            state ^= state << 25;
+            state ^= state >> 27;
+            state.wrapping_mul(0x2545F4914F6CDD1D)
         };
+
+        let mut chosen: Vec<usize> = Vec::new();
+        for (ci, cat) in crate::ui::CATEGORIES.iter().enumerate() {
+            let cap = caps.get(ci).copied().unwrap_or(0);
+            if cap == 0 {
+                continue;
+            }
+            // Indices of elements in this category; partial Fisher–Yates picks
+            // the first `n` after shuffling.
+            let mut idxs: Vec<usize> = (0..self.elements.len())
+                .filter(|&i| self.element_cats.get(i) == Some(&Some(*cat)))
+                .collect();
+            let n = cap.min(idxs.len());
+            for k in 0..n {
+                let j = k + (rng() as usize) % (idxs.len() - k);
+                idxs.swap(k, j);
+            }
+            chosen.extend_from_slice(&idxs[..n]);
+        }
+
+        let els: Vec<_> = chosen.iter().map(|&i| self.elements[i].clone()).collect();
         let bodies = bodies_from_elements(&els);
         if bodies.is_empty() {
             log::warn!("group '{}' produced no usable bodies; using demo", self.group);
             return World::demo(self.epoch0);
         }
-        log::info!("tracking {} objects from '{}'", bodies.len(), self.group);
+        log::info!("showing {} of {} '{}' objects (per-type caps)",
+            bodies.len(), self.elements.len(), self.group);
         World::new(self.epoch0, bodies)
     }
 
@@ -240,11 +268,12 @@ impl App {
             self.epoch0 = now_epoch();
         }
 
-        // Re-sample the group when the panel slider committed a new count.
+        // Re-sample the group when a per-type "max shown" slider committed.
         if self.ui.resample {
             self.ui.resample = false;
             self.ui.selected = None;
-            let world = self.world_from_count(self.ui.sample_count);
+            let caps = self.type_caps();
+            let world = self.world_from_caps(&caps);
             if let Some(r) = self.renderer.as_mut() {
                 r.set_world(world);
             }
@@ -352,16 +381,19 @@ impl ApplicationHandler for App {
         self.start = Instant::now();
         self.epoch0 = now_epoch();
 
-        // Load the group once; the panel slider re-samples from this set live.
+        // Load + classify the group once; the per-type sliders re-sample live.
         self.elements = self.load_elements();
-        let total = self.elements.len();
-        let initial = match self.sample {
-            Some(n) if total > 0 => n.clamp(1, total),
-            _ => total,
-        };
-        self.ui.sample_total = total;
-        self.ui.sample_count = initial;
-        let world = self.world_from_count(initial);
+        self.element_cats = classify_elements(&self.elements);
+        // A `--sample N` flag seeds every type's initial cap (clamped to the
+        // slider max); otherwise each type keeps its default cap.
+        if let Some(n) = self.sample {
+            let cap = n.min(crate::ui::MAX_SAMPLE);
+            for t in self.ui.settings.types.iter_mut() {
+                t.max_shown = cap;
+            }
+        }
+        let caps = self.type_caps();
+        let world = self.world_from_caps(&caps);
         let renderer = pollster::block_on(Renderer::new(window.clone(), world));
 
         self.last_cursor = None;

@@ -6,10 +6,16 @@
 //! renderer applies the GMST spin as a model rotation, which is what keeps
 //! coastlines aligned with the inertial-frame satellites.
 
+use glam::DVec3;
+
 use horizon_core::frames::geo_to_render;
 
 use crate::data::PolyLine;
 use crate::renderer::mesh::{self, VertexPC};
+
+/// Safety cap on the subdivision recursion (the chord tolerance normally stops
+/// it well before this); 4^8 leaves per source triangle worst case.
+const MAX_SUBDIV_DEPTH: u32 = 8;
 
 /// Convert geographic coordinates (degrees) to render-frame coordinates at the
 /// given render radius (Earth surface = 1.0).
@@ -41,16 +47,72 @@ pub fn build_thick_lines(
 }
 
 /// Triangulate each closed ring and append the triangles to `out` (TriangleList
-/// topology: three vertices per triangle), projected onto the sphere. Used to
-/// give land a faint translucent body. Rings are triangulated in lon/lat space
-/// by ear clipping; at 110m resolution the per-triangle spherical distortion is
-/// negligible.
-pub fn build_fill(rings: &[PolyLine], color: [f32; 3], radius: f32, out: &mut Vec<VertexPC>) {
+/// topology: three vertices per triangle), conforming to the sphere. Used to
+/// give land a faint translucent body.
+///
+/// Ear clipping produces flat triangles in lon/lat; a big country yields
+/// triangles spanning tens of degrees, and a flat chord that large sags far
+/// below the curved surface (visible up close as facets cutting through the
+/// globe). So each triangle is recursively subdivided — splitting edges at their
+/// geodesic midpoints and snapping them back onto the sphere — until every edge
+/// spans at most `tol_rad` radians, making the fill hug the curvature.
+pub fn build_fill(
+    rings: &[PolyLine],
+    color: [f32; 3],
+    radius: f32,
+    tol_rad: f64,
+    out: &mut Vec<VertexPC>,
+) {
+    // An edge is "small enough" when its chord (on the unit sphere) is within
+    // tolerance; chord = 2 sin(theta/2) for an edge subtending angle theta.
+    let max_chord = 2.0 * (tol_rad.max(1e-4) * 0.5).sin();
+    let max_chord2 = max_chord * max_chord;
     for ring in rings {
-        for v in triangulate(ring) {
-            out.push(VertexPC { pos: latlon_to_xyz(v[0], v[1], radius), col: color });
+        let tris = triangulate(ring);
+        for t in tris.chunks_exact(3) {
+            // Triangle corners as unit-sphere points in the render frame.
+            let a = geo_to_render(t[0][0], t[0][1], 1.0);
+            let b = geo_to_render(t[1][0], t[1][1], 1.0);
+            let c = geo_to_render(t[2][0], t[2][1], 1.0);
+            subdivide_to_sphere(a, b, c, max_chord2, radius as f64, color, 0, out);
         }
     }
+}
+
+/// Recursively split triangle `a,b,c` (unit-sphere points) at geodesic midpoints
+/// until every edge's chord length is within `max_chord2`, then emit the leaf
+/// triangles scaled to `radius`. New vertices are re-normalised onto the sphere
+/// so the result conforms to the curvature rather than being a flat chord.
+#[allow(clippy::too_many_arguments)]
+fn subdivide_to_sphere(
+    a: DVec3,
+    b: DVec3,
+    c: DVec3,
+    max_chord2: f64,
+    radius: f64,
+    color: [f32; 3],
+    depth: u32,
+    out: &mut Vec<VertexPC>,
+) {
+    let longest = (a - b)
+        .length_squared()
+        .max((b - c).length_squared())
+        .max((c - a).length_squared());
+    if depth >= MAX_SUBDIV_DEPTH || longest <= max_chord2 {
+        for p in [a, b, c] {
+            out.push(VertexPC { pos: (p * radius).as_vec3().to_array(), col: color });
+        }
+        return;
+    }
+    // 1-to-4 split; normalising the midpoints keeps them on the sphere.
+    let ab = (a + b).normalize();
+    let bc = (b + c).normalize();
+    let ca = (c + a).normalize();
+    let d = depth + 1;
+    subdivide_to_sphere(a, ab, ca, max_chord2, radius, color, d, out);
+    subdivide_to_sphere(ab, b, bc, max_chord2, radius, color, d, out);
+    subdivide_to_sphere(ca, bc, c, max_chord2, radius, color, d, out);
+    subdivide_to_sphere(ab, bc, ca, max_chord2, radius, color, d, out);
 }
 
 /// Ear-clipping triangulation of a simple polygon ring (lon/lat). Returns a flat

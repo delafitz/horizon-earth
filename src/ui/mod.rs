@@ -22,8 +22,16 @@ pub struct RenderSettings {
     pub marker_size: f32,
     pub show_labels: bool,
     pub show_tracks: bool,
-    /// Near-side orbit-track opacity (far side is drawn at 0.4× this).
+    /// Near-side orbit-track opacity.
     pub track_alpha: f32,
+    /// Far-side opacity multiplier for satellite layers (markers/tracks/ground),
+    /// seen "through the glass".
+    pub sat_back_alpha: f32,
+    pub ground_visible: bool,
+    /// Ground-anchor (nadir line + footprint ring) stroke width in pixels.
+    pub ground_width: f32,
+    /// Ground-anchor opacity.
+    pub ground_alpha: f32,
     /// Per-type attributes (visibility, symbol, size, track), indexed parallel
     /// to [`CATEGORIES`].
     pub types: [TypeStyle; CATEGORIES.len()],
@@ -57,6 +65,10 @@ impl Default for RenderSettings {
             show_labels: true,
             show_tracks: true,
             track_alpha: 0.35,
+            sat_back_alpha: 0.4,
+            ground_visible: true,
+            ground_width: 1.5,
+            ground_alpha: 0.5,
             types: [TypeStyle::default(); CATEGORIES.len()],
             line_brightness: 1.0,
             line_back_alpha: 0.28,
@@ -136,6 +148,15 @@ impl RenderSettings {
             0.0
         }
     }
+
+    /// Ground-anchor width in px, `0.0` when hidden.
+    pub fn ground_width_px(&self) -> f32 {
+        if self.ground_visible {
+            self.ground_width
+        } else {
+            0.0
+        }
+    }
 }
 
 /// Per-satellite-type render attributes.
@@ -146,13 +167,24 @@ pub struct TypeStyle {
     /// On-screen marker size multiplier for this type.
     pub size: f32,
     pub show_track: bool,
+    /// Max objects of this type to show (random subset). Capped at [`MAX_SAMPLE`].
+    pub max_shown: usize,
 }
 
 impl Default for TypeStyle {
     fn default() -> Self {
-        Self { visible: true, symbol: Symbol::Auto, size: 1.0, show_track: true }
+        Self {
+            visible: true,
+            symbol: Symbol::Auto,
+            size: 1.0,
+            show_track: true,
+            max_shown: MAX_SAMPLE,
+        }
     }
 }
+
+/// Upper bound of the per-type "max shown" slider.
+pub const MAX_SAMPLE: usize = 200;
 
 /// The categories shown (in order) in the per-type symbol editor.
 pub const CATEGORIES: [Category; 6] = [
@@ -208,13 +240,8 @@ pub struct UiState {
     pub selected: Option<usize>,
     /// Case-insensitive substring filter for the body list.
     pub filter: String,
-
-    // --- Random sampling of the loaded group ---
-    /// How many objects to show (random subset). 0 = no sampling control.
-    pub sample_count: usize,
-    /// Total objects available in the loaded group (slider upper bound).
-    pub sample_total: usize,
-    /// Set by the slider when the count changes; the app re-samples and clears it.
+    /// Set when a per-type "max shown" slider changes; the app re-samples the
+    /// group (per type) and clears it.
     pub resample: bool,
 }
 
@@ -226,8 +253,6 @@ impl UiState {
             time_scale,
             selected: None,
             filter: String::new(),
-            sample_count: 0,
-            sample_total: 0,
             resample: false,
         }
     }
@@ -361,8 +386,6 @@ fn properties_panel(ctx: &Context, ui: &mut UiState, world: &World) {
             );
 
             let selected = ui.selected;
-            let sample_total = ui.sample_total;
-            let mut sample_count = ui.sample_count;
             let mut request_resample = false;
             let s = &mut ui.settings;
             p.add_space(6.0);
@@ -370,17 +393,6 @@ fn properties_panel(ctx: &Context, ui: &mut UiState, world: &World) {
             egui::CollapsingHeader::new("Satellites")
                 .default_open(true)
                 .show(p, |c| {
-                    if sample_total > 0 {
-                        let resp = c.add(
-                            egui::Slider::new(&mut sample_count, 1..=sample_total)
-                                .text(format!("shown / {sample_total}")),
-                        );
-                        // Re-sample on a committed change (release / click /
-                        // keyboard), not on every drag tick.
-                        if resp.drag_stopped() || (resp.changed() && !resp.dragged()) {
-                            request_resample = true;
-                        }
-                    }
                     c.add(egui::Slider::new(&mut s.marker_size, 0.25..=4.0).text("marker size"));
                     c.checkbox(&mut s.show_labels, "labels");
                     c.checkbox(&mut s.show_tracks, "orbit tracks");
@@ -388,6 +400,26 @@ fn properties_panel(ctx: &Context, ui: &mut UiState, world: &World) {
                         s.show_tracks,
                         egui::Slider::new(&mut s.track_alpha, 0.0..=1.0).text("track opacity"),
                     );
+                    c.add(
+                        egui::Slider::new(&mut s.sat_back_alpha, 0.0..=1.0)
+                            .text("far-side opacity"),
+                    );
+
+                    egui::CollapsingHeader::new("Ground anchors")
+                        .id_salt("ground")
+                        .default_open(false)
+                        .show(c, |g| {
+                            g.checkbox(&mut s.ground_visible, "visible");
+                            g.add_enabled(
+                                s.ground_visible,
+                                egui::Slider::new(&mut s.ground_width, 0.5..=6.0).text("width px"),
+                            );
+                            g.add_enabled(
+                                s.ground_visible,
+                                egui::Slider::new(&mut s.ground_alpha, 0.0..=1.0).text("opacity"),
+                            );
+                        });
+
                     c.add_space(4.0);
                     c.label(RichText::new("BY TYPE").weak());
                     for (i, &cat) in CATEGORIES.iter().enumerate() {
@@ -398,6 +430,14 @@ fn properties_panel(ctx: &Context, ui: &mut UiState, world: &World) {
                             .default_open(false)
                             .show(c, |g| {
                                 g.checkbox(&mut t.visible, "visible");
+                                // Max objects of this type to show (random subset).
+                                let resp = g.add(
+                                    egui::Slider::new(&mut t.max_shown, 0..=MAX_SAMPLE)
+                                        .text("max shown"),
+                                );
+                                if resp.drag_stopped() || (resp.changed() && !resp.dragged()) {
+                                    request_resample = true;
+                                }
                                 g.horizontal(|h| {
                                     h.label("symbol");
                                     egui::ComboBox::from_id_salt(("symbol", i))
@@ -475,9 +515,7 @@ fn properties_panel(ctx: &Context, ui: &mut UiState, world: &World) {
                 }
             }
 
-            // Persist the sample slider (and flag a resample) now that the
-            // settings borrow is done.
-            ui.sample_count = sample_count;
+            // Flag a re-sample now that the settings borrow is done.
             if request_resample {
                 ui.resample = true;
             }
