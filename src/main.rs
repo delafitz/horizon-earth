@@ -23,13 +23,14 @@ Options:
   -n, --no-exit      Don't quit on input (enables orbit camera; Escape still quits)
   -d, --demo         Accelerated demo time instead of live wall-clock positions
       --group NAME   CelesTrak group to track (default: stations)
+      --sample N     Show a random N-object subset of the group (e.g. 200)
       --offline      Skip the network; use cached TLEs or the demo constellation
   -v, --verbose      Verbose logging (equivalent to RUST_LOG=info)
   -h, --help         Print this help
 
 Most flags have an equivalent environment variable:
   HORIZON_WINDOWED=1, HORIZON_NO_EXIT=1, HORIZON_DEMO=1, HORIZON_OFFLINE=1,
-  HORIZON_GROUP=<name>, RUST_LOG=info
+  HORIZON_GROUP=<name>, HORIZON_SAMPLE=<n>, RUST_LOG=info
 
 Real satellites come from CelesTrak (e.g. --group gps-ops, starlink, visual);
 they're cached under cache/. In interactive mode ('--no-exit'), press T to
@@ -44,6 +45,7 @@ struct Options {
     demo: bool,
     offline: bool,
     group: String,
+    sample: Option<usize>,
     verbose: bool,
 }
 
@@ -55,6 +57,7 @@ impl Options {
             demo: std::env::var_os("HORIZON_DEMO").is_some(),
             offline: std::env::var_os("HORIZON_OFFLINE").is_some(),
             group: std::env::var("HORIZON_GROUP").unwrap_or_else(|_| "stations".to_string()),
+            sample: std::env::var("HORIZON_SAMPLE").ok().and_then(|v| v.parse().ok()),
             verbose: false,
         };
         let mut args = std::env::args().skip(1);
@@ -69,6 +72,13 @@ impl Options {
                     Some(g) => o.group = g,
                     None => {
                         eprint!("horizon: --group needs a value\n\n{USAGE}");
+                        std::process::exit(2);
+                    }
+                },
+                "--sample" => match args.next().and_then(|v| v.parse().ok()) {
+                    Some(n) => o.sample = Some(n),
+                    None => {
+                        eprint!("horizon: --sample needs a positive integer\n\n{USAGE}");
                         std::process::exit(2);
                     }
                 },
@@ -98,6 +108,13 @@ fn main() {
     // Poll continuously so the globe animates every frame.
     event_loop.set_control_flow(ControlFlow::Poll);
 
-    let mut app = app::App::new(opts.windowed, opts.no_exit, opts.demo, opts.group, opts.offline);
+    let mut app = app::App::new(
+        opts.windowed,
+        opts.no_exit,
+        opts.demo,
+        opts.group,
+        opts.offline,
+        opts.sample,
+    );
     event_loop.run_app(&mut app).expect("event loop error");
 }

@@ -41,6 +41,31 @@ fn now_epoch() -> Epoch {
 /// How long a cached TLE set is considered fresh.
 const TLE_MAX_AGE: Duration = Duration::from_secs(6 * 3600);
 
+/// Randomly choose `n` of `els` via a partial Fisher–Yates shuffle, seeded from
+/// the wall clock so each run differs. Assumes `n < els.len()` (the caller
+/// checks); returns the first `n` after shuffling those slots.
+fn sample_elements(mut els: Vec<horizon_core::Elements>, n: usize) -> Vec<horizon_core::Elements> {
+    // xorshift64* — tiny, dependency-free; seed must be non-zero.
+    let mut state = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
+        | 1;
+    let mut next = move || {
+        state ^= state >> 12;
+        state ^= state << 25;
+        state ^= state >> 27;
+        state.wrapping_mul(0x2545F4914F6CDD1D)
+    };
+    let len = els.len();
+    for i in 0..n {
+        let j = i + (next() as usize) % (len - i);
+        els.swap(i, j);
+    }
+    els.truncate(n);
+    els
+}
+
 pub struct App {
     window: Option<Arc<Window>>,
     renderer: Option<Renderer>,
@@ -49,6 +74,8 @@ pub struct App {
     time_mode: TimeMode,
     group: String,
     offline: bool,
+    /// If set, show a random subset of this many objects from the group.
+    sample: Option<usize>,
     last_cursor: Option<(f64, f64)>,
     dragging: bool,
     no_exit: bool,
@@ -64,7 +91,14 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(windowed: bool, no_exit: bool, demo: bool, group: String, offline: bool) -> Self {
+    pub fn new(
+        windowed: bool,
+        no_exit: bool,
+        demo: bool,
+        group: String,
+        offline: bool,
+        sample: Option<usize>,
+    ) -> Self {
         Self {
             window: None,
             renderer: None,
@@ -73,6 +107,7 @@ impl App {
             time_mode: if demo { TimeMode::Demo } else { TimeMode::Live },
             group,
             offline,
+            sample,
             last_cursor: None,
             dragging: false,
             no_exit,
@@ -105,7 +140,15 @@ impl App {
             horizon_data::load_group(&self.group, cache, TLE_MAX_AGE)
         };
         match loaded {
-            Ok(els) => {
+            Ok(mut els) => {
+                // Optionally show a random subset (e.g. 200 of ~6500 Starlink).
+                if let Some(n) = self.sample {
+                    if n < els.len() {
+                        let total = els.len();
+                        els = sample_elements(els, n);
+                        log::info!("sampled {} of {} '{}' objects", els.len(), total, self.group);
+                    }
+                }
                 let bodies = bodies_from_elements(&els);
                 if !bodies.is_empty() {
                     log::info!("tracking {} objects from '{}'", bodies.len(), self.group);
