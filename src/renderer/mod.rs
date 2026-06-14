@@ -1,16 +1,18 @@
 //! wgpu rendering: surface setup, pipelines, and the per-frame draw.
 
+mod glyphs;
 pub mod mesh;
 
 use std::sync::Arc;
 
 use bytemuck::{Pod, Zeroable};
-use glam::Mat4;
+use glam::{Mat4, Vec3, Vec4};
 use wgpu::util::DeviceExt;
 use winit::window::Window;
 
 use horizon_core::frames::eci_to_world;
 use horizon_core::orbit::sample_track;
+use horizon_core::units::EARTH_RADIUS_KM;
 use horizon_core::{Epoch, OrbitCamera, World};
 use mesh::{MarkerInstance, VertexPC, VertexPN};
 
@@ -37,11 +39,19 @@ const ATTRS_PC: [wgpu::VertexAttribute; 2] =
     wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3];
 const ATTRS_POS: [wgpu::VertexAttribute; 1] = wgpu::vertex_attr_array![0 => Float32x3];
 const ATTRS_CORNER: [wgpu::VertexAttribute; 1] = wgpu::vertex_attr_array![0 => Float32x2];
+// loc 1 = center+size (vec4); loc 2 = color.rgb + kind (vec4).
 const ATTRS_MARKER_INST: [wgpu::VertexAttribute; 2] =
-    wgpu::vertex_attr_array![1 => Float32x4, 2 => Float32x3];
+    wgpu::vertex_attr_array![1 => Float32x4, 2 => Float32x4];
 
 // On-screen half-size of a body marker, in NDC units.
 const MARKER_SIZE: f32 = 0.02;
+
+// Vector label line vertex: NDC position + colour.
+const ATTRS_LABEL: [wgpu::VertexAttribute; 2] =
+    wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x3];
+// Glyph cell height (px) and the per-frame line-vertex cap.
+const LABEL_PX: f32 = 11.0;
+const MAX_LABEL_VERTS: usize = 16384;
 
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable)]
@@ -72,6 +82,9 @@ pub struct Renderer {
     track_pipeline: wgpu::RenderPipeline,
     markers_back_pipeline: wgpu::RenderPipeline,
     markers_pipeline: wgpu::RenderPipeline,
+    label_pipeline: wgpu::RenderPipeline,
+    label_vbuf: wgpu::Buffer,
+    label_vcount: u32,
 
     sphere_vbuf: wgpu::Buffer,
     sphere_ibuf: wgpu::Buffer,
@@ -303,6 +316,61 @@ impl Renderer {
             wgpu::CompareFunction::LessEqual, "fs_main",
         );
 
+        // --- HUD label text -------------------------------------------------
+        // Vector stroke font drawn as screen-space lines (positions already NDC,
+        // so no uniforms/bind groups are needed).
+        let label_sh = shader(&device, "label", include_str!("../../assets/shaders/label.wgsl"));
+        let label_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("label-pipeline-layout"),
+            bind_group_layouts: &[],
+            push_constant_ranges: &[],
+        });
+        let label_vbuf_layout = wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<mesh::LabelVertex>() as u64,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &ATTRS_LABEL,
+        };
+        let label_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("label"),
+            layout: Some(&label_layout),
+            vertex: wgpu::VertexState {
+                module: &label_sh,
+                entry_point: "vs_main",
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                buffers: &[label_vbuf_layout],
+            },
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::LineList,
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: false,
+                depth_compare: wgpu::CompareFunction::Always,
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &label_sh,
+                entry_point: "fs_main",
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            multiview: None,
+            cache: None,
+        });
+        let label_vbuf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("label-verts"),
+            size: (MAX_LABEL_VERTS * std::mem::size_of::<mesh::LabelVertex>()) as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
         // --- Geometry --------------------------------------------------------
         let (sverts, sidx) = mesh::uv_sphere(64, 96, 1.0);
         let sphere_vbuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -423,6 +491,9 @@ impl Renderer {
             track_pipeline,
             markers_back_pipeline,
             markers_pipeline,
+            label_pipeline,
+            label_vbuf,
+            label_vcount: 0,
             sphere_vbuf,
             sphere_ibuf,
             sphere_icount,
@@ -461,7 +532,9 @@ impl Renderer {
     pub fn update(&mut self, now: Epoch) {
         self.world.set_time(now);
 
-        let aspect = self.config.width as f32 / self.config.height.max(1) as f32;
+        let width = self.config.width as f32;
+        let height = self.config.height.max(1) as f32;
+        let aspect = width / height;
         let view_proj = self.camera.view_proj(aspect as f64).as_mat4();
         let eye = self.camera.eye().as_vec3();
         // The Earth's orientation is GMST(now): the rotation carrying the
@@ -473,7 +546,7 @@ impl Renderer {
             view_proj: view_proj.to_cols_array_2d(),
             model: model.to_cols_array_2d(),
             cam_pos: [eye.x, eye.y, eye.z, 1.0],
-            params: [aspect, 0.0, 0.0, 0.0],
+            params: [aspect, width, height, 0.0],
         };
         self.queue
             .write_buffer(&self.uniform_buf, 0, bytemuck::cast_slice(&[u]));
@@ -483,15 +556,80 @@ impl Renderer {
         let instances: Vec<MarkerInstance> = (0..self.world.bodies.len())
             .map(|i| {
                 let p = eci_to_world(self.world.body_position_eci(i)).as_vec3();
+                let b = &self.world.bodies[i];
                 MarkerInstance {
-                    center_size: [p.x, p.y, p.z, MARKER_SIZE],
-                    color: self.world.bodies[i].color,
-                    _pad: 0.0,
+                    center_size: [p.x, p.y, p.z, MARKER_SIZE * b.category.size_scale()],
+                    color: b.color,
+                    kind: if b.category.filled() { 1.0 } else { 0.0 },
                 }
             })
             .collect();
         self.queue
             .write_buffer(&self.marker_inst_buf, 0, bytemuck::cast_slice(&instances));
+
+        // HUD labels: project bodies to screen, drop occluded/overlapping ones.
+        let verts = self.build_labels(view_proj, eye, width, height);
+        self.label_vcount = verts.len() as u32;
+        self.queue
+            .write_buffer(&self.label_vbuf, 0, bytemuck::cast_slice(&verts));
+    }
+
+    /// Build line vertices for visible body labels (name + altitude), in the
+    /// body's category colour. Bodies hidden behind the globe are skipped, and
+    /// labels that would overlap an already-placed one are dropped (nearest
+    /// body wins).
+    fn build_labels(
+        &self,
+        view_proj: Mat4,
+        eye: Vec3,
+        width: f32,
+        height: f32,
+    ) -> Vec<mesh::LabelVertex> {
+        let unit = LABEL_PX / glyphs::GH; // px per grid unit (square)
+        let line_h = LABEL_PX + 5.0; // px between the two text lines
+        let off_x = LABEL_PX; // px from the marker to the text
+        let min_sep = LABEL_PX * 1.6; // declutter radius, px
+
+        // Project every visible body; collect (camera distance, screen px, index).
+        let mut cands: Vec<(f32, [f32; 2], usize)> = Vec::new();
+        for i in 0..self.world.bodies.len() {
+            let p = eci_to_world(self.world.body_position_eci(i)).as_vec3();
+            if occluded_by_globe(eye, p) {
+                continue;
+            }
+            let clip = view_proj * Vec4::new(p.x, p.y, p.z, 1.0);
+            if clip.w <= 0.0 {
+                continue; // behind the camera
+            }
+            let nx = clip.x / clip.w;
+            let ny = clip.y / clip.w;
+            if nx.abs() > 1.1 || ny.abs() > 1.1 {
+                continue; // off screen
+            }
+            let px = [(nx * 0.5 + 0.5) * width, (1.0 - (ny * 0.5 + 0.5)) * height];
+            cands.push(((p - eye).length(), px, i));
+        }
+        cands.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+
+        let mut placed: Vec<[f32; 2]> = Vec::new();
+        let mut out: Vec<mesh::LabelVertex> = Vec::new();
+        for (_, px, i) in cands {
+            if placed.iter().any(|q| (q[0] - px[0]).hypot(q[1] - px[1]) < min_sep) {
+                continue;
+            }
+            placed.push(px);
+
+            let b = &self.world.bodies[i];
+            let ox = px[0] + off_x;
+            let oy = px[1] - LABEL_PX * 0.5;
+            let alt = (self.world.body_position_eci(i).length() - EARTH_RADIUS_KM).max(0.0);
+            emit_text(&mut out, &b.name, ox, oy, b.color, unit, width, height);
+            emit_text(&mut out, &format!("{alt:.0} KM"), ox, oy + line_h, b.color, unit, width, height);
+            if out.len() + 512 > MAX_LABEL_VERTS {
+                break;
+            }
+        }
+        out
     }
 
     pub fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
@@ -587,6 +725,13 @@ impl Renderer {
                 rp.set_vertex_buffer(1, self.marker_inst_buf.slice(..));
                 rp.draw(0..6, 0..body_count);
             }
+
+            // HUD labels on top of everything (group 0 = uniforms already set).
+            if self.label_vcount > 0 {
+                rp.set_pipeline(&self.label_pipeline);
+                rp.set_vertex_buffer(0, self.label_vbuf.slice(..));
+                rp.draw(0..self.label_vcount, 0..1);
+            }
         }
 
         self.queue.submit(Some(enc.finish()));
@@ -621,6 +766,51 @@ fn create_depth_view(
         view_formats: &[],
     });
     tex.create_view(&wgpu::TextureViewDescriptor::default())
+}
+
+/// Is `p` (render units) hidden behind the unit globe as seen from `eye`?
+fn occluded_by_globe(eye: Vec3, p: Vec3) -> bool {
+    let d = p - eye;
+    let len = d.length();
+    if len < 1e-6 {
+        return false;
+    }
+    let dir = d / len;
+    let b = dir.dot(eye);
+    let c = eye.length_squared() - 1.0; // globe radius = 1
+    let disc = b * b - c;
+    if disc <= 0.0 {
+        return false; // ray misses the globe
+    }
+    let t = -b - disc.sqrt(); // near intersection
+    t > 1e-3 && t < len - 1e-3 // globe sits between the eye and the body
+}
+
+/// Append vector-stroke line vertices for one line of `text`, with its top-left
+/// at screen pixel `(ox, oy)`. `unit` is pixels per glyph grid unit.
+#[allow(clippy::too_many_arguments)]
+fn emit_text(
+    out: &mut Vec<mesh::LabelVertex>,
+    text: &str,
+    ox: f32,
+    oy: f32,
+    color: [f32; 3],
+    unit: f32,
+    width: f32,
+    height: f32,
+) {
+    let to_ndc = |px: f32, py: f32| [px / width * 2.0 - 1.0, 1.0 - py / height * 2.0];
+    let advance = (glyphs::GW + 1.0) * unit; // glyph cell + one-unit gap
+    let mut cx = ox;
+    for ch in text.bytes().map(|c| c.to_ascii_uppercase()) {
+        for s in glyphs::strokes(ch) {
+            let p0 = to_ndc(cx + s[0] as f32 * unit, oy + s[1] as f32 * unit);
+            let p1 = to_ndc(cx + s[2] as f32 * unit, oy + s[3] as f32 * unit);
+            out.push(mesh::LabelVertex { pos: p0, col: color });
+            out.push(mesh::LabelVertex { pos: p1, col: color });
+        }
+        cx += advance;
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

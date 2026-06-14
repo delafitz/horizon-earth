@@ -7,25 +7,18 @@
 
 use glam::DVec3;
 
+use crate::category::Category;
 use crate::orbit::{KeplerOrbit, Propagator, Sgp4Orbit};
 use crate::time::{gmst, Epoch};
 
 /// Default simulated-seconds-per-real-second for demo mode.
 pub const DEFAULT_TIME_SCALE: f64 = 500.0;
 
-/// Nord aurora palette, cycled across tracked bodies.
-const PALETTE: [[f32; 3]; 5] = [
-    [0.749, 0.380, 0.416], // Nord11
-    [0.816, 0.529, 0.439], // Nord12
-    [0.922, 0.796, 0.545], // Nord13
-    [0.639, 0.745, 0.549], // Nord14
-    [0.706, 0.557, 0.678], // Nord15
-];
-
 /// An orbiting body (satellite, station, …).
 pub struct Body {
     pub name: String,
-    /// Render colour (linear RGB).
+    pub category: Category,
+    /// Render colour (linear RGB), derived from the category.
     pub color: [f32; 3],
     pub motion: Box<dyn Propagator + Send + Sync>,
 }
@@ -44,25 +37,26 @@ impl World {
     /// (LEO → MEO), referenced to `epoch0`.
     pub fn demo(epoch0: Epoch) -> Self {
         let deg = |x: f64| x.to_radians();
-        let body = |name: &str, color, orbit| Body {
+        let body = |name: &str, cat: Category, orbit: KeplerOrbit| Body {
             name: name.to_string(),
-            color,
+            category: cat,
+            color: cat.color(),
             motion: Box::new(orbit) as Box<dyn Propagator + Send + Sync>,
         };
         let bodies = vec![
             body(
                 "ISS",
-                [0.749, 0.380, 0.416], // Nord11
+                Category::Station,
                 KeplerOrbit::circular(epoch0, 420.0, deg(51.6), deg(40.0), 0.0),
             ),
             body(
                 "Polar LEO",
-                [0.922, 0.796, 0.545], // Nord13
+                Category::Leo,
                 KeplerOrbit::circular(epoch0, 800.0, deg(98.0), deg(120.0), 1.5),
             ),
             body(
                 "GPS (MEO)",
-                [0.639, 0.745, 0.549], // Nord14
+                Category::Gnss,
                 KeplerOrbit::circular(epoch0, 20_180.0, deg(55.0), deg(200.0), 3.0),
             ),
         ];
@@ -96,15 +90,17 @@ pub fn bodies_from_elements(elements: &[crate::Elements]) -> Vec<Body> {
     elements
         .iter()
         .enumerate()
-        .filter_map(|(i, el)| {
+        .filter_map(|(_, el)| {
             let motion = Sgp4Orbit::from_elements(el).ok()?;
             let name = el
                 .object_name
                 .clone()
                 .unwrap_or_else(|| format!("NORAD {}", el.norad_id));
+            let category = Category::classify(&name, motion.period());
             Some(Body {
                 name,
-                color: PALETTE[i % PALETTE.len()],
+                category,
+                color: category.color(),
                 motion: Box::new(motion),
             })
         })

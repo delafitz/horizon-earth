@@ -26,7 +26,16 @@ pub struct MarkerInstance {
     /// World-space centre in `.xyz`, billboard half-size (NDC) in `.w`.
     pub center_size: [f32; 4],
     pub color: [f32; 3],
-    pub _pad: f32,
+    /// Symbol: 0.0 = outline box, 1.0 = filled square.
+    pub kind: f32,
+}
+
+/// Screen-space (NDC) line vertex for vector HUD text: position + colour.
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable)]
+pub struct LabelVertex {
+    pub pos: [f32; 2],
+    pub col: [f32; 3],
 }
 
 /// Two-triangle unit quad in `[-1, 1]`, expanded per-instance in the shader.

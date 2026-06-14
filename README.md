@@ -22,9 +22,12 @@ with real UTC epochs, GMST-driven Earth orientation, ECI/render frames, and a
 `Propagator` abstraction with both Keplerian two-body and **SGP4** motion. Real
 tracked objects come from CelesTrak via `horizon-data` (cached, offline-capable),
 with **live** (true current positions) and **demo** (accelerated) time modes.
+Bodies are classified (station/LEO/Starlink/GNSS/GEO) into Nord colours and box
+vs filled-square markers, with HUD labels (name + altitude) in a rectilinear
+vector stroke font, occlusion-culled and decluttered.
 
-Upcoming: cities/labels and a HUD; selection/info on bodies; screensaver
-integration (Phase 5, `wlr-layer-shell`).
+Upcoming: cities; selection/info panels; screensaver integration
+(Phase 5, `wlr-layer-shell`).
 
 ## Tech stack
 
@@ -93,6 +96,7 @@ horizon-core/        simulation core — f64, no rendering/windowing/network dep
     time.rs          UTC epoch (Julian Date) + GMST
     frames.rs        ECI <-> render-frame bridge; lat/lon -> ECEF/render
     orbit.rs         Propagator trait; Keplerian two-body + SGP4 propagators
+    category.rs      classify a body (name + orbit) -> Nord colour + symbol
     camera.rs        orbit (arcball) camera: target/distance/yaw/pitch -> view
     world.rs         current epoch + GMST rotation + bodies (demo + from TLEs)
 horizon-data/        CelesTrak TLE/OMM fetch + on-disk cache (the network side)
@@ -103,9 +107,10 @@ src/                 the app (depends on horizon-core + horizon-data)
   earth/             lat/lon -> sphere projection, line-segment building
   renderer/          wgpu surface, pipelines, per-frame draw
     mesh.rs          vertex types, UV sphere, marker quad/instance
+    glyphs.rs        rectilinear vector stroke font (HUD labels)
 assets/
   earth/             Natural Earth GeoJSON (embedded at build time)
-  shaders/           WGSL: starfield, globe, lines, track, markers, atmosphere
+  shaders/           WGSL: starfield, globe, lines, track, markers, atmosphere, label
 cache/               runtime caches (later phases)
 ```
 
@@ -171,10 +176,13 @@ The glow is driven by the view ray's closest approach to the globe centre (the
 | `PALETTE` | `horizon-core/src/world.rs` | Colours cycled across tracked bodies. |
 | `DEFAULT_TIME_SCALE` | `horizon-core/src/world.rs` | Demo-mode simulated seconds per real second. |
 | orbital elements / `circular(...)` | `horizon-core/src/orbit.rs` | Semi-major axis, eccentricity, inclination, RAAN, arg. periapsis, mean anomaly. |
-| `MARKER_SIZE` | `src/renderer/mod.rs` | On-screen marker size (NDC). |
+| `Category` color/filled/size | `horizon-core/src/category.rs` | Per-category Nord colour, box vs filled square, bold size. |
+| `MARKER_SIZE` | `src/renderer/mod.rs` | Base on-screen marker size (NDC); scaled per category. |
 | `sample_track(.., 128)` | `src/renderer/mod.rs` | Orbit-track smoothness (segment count). |
+| `LABEL_PX` | `src/renderer/mod.rs` | HUD label glyph height (px); declutter/spacing derive from it. |
+| `strokes(..)` | `src/renderer/glyphs.rs` | Vector font letterforms (3x5 stroke grid). |
 | alpha `0.35` in `fs_main` | `assets/shaders/track.wgsl` | Orbit-track faintness. |
-| `smoothstep` / `core` | `assets/shaders/markers.wgsl` | Marker dot softness and core brightness. |
+| `square_alpha` | `assets/shaders/markers.wgsl` | Box/filled-square shape, edge softness, outline thickness. |
 
 ### Camera & input
 

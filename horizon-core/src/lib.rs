@@ -16,6 +16,7 @@
 //!   the two; everything physical stays in ECI/km until then.
 
 pub mod camera;
+pub mod category;
 pub mod frames;
 pub mod orbit;
 pub mod time;
@@ -23,6 +24,7 @@ pub mod units;
 pub mod world;
 
 pub use camera::OrbitCamera;
+pub use category::Category;
 pub use orbit::{KeplerOrbit, Propagator, Sgp4Orbit};
 pub use time::{gmst, Epoch};
 pub use world::{Body, World};
