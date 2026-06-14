@@ -6,10 +6,8 @@
 //! screensaver.
 
 mod app;
-mod camera;
 mod data;
 mod earth;
-mod orbit;
 mod renderer;
 
 use winit::event_loop::{ControlFlow, EventLoop};

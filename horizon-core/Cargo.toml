@@ -1,0 +1,8 @@
+[package]
+name = "horizon-core"
+version = "0.1.0"
+edition = "2021"
+description = "Engine-agnostic simulation core: units, frames, orbits, camera (f64). No rendering or windowing dependencies."
+
+[dependencies]
+glam = "0.29"

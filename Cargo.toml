@@ -9,6 +9,7 @@ name = "horizon"
 path = "src/main.rs"
 
 [dependencies]
+horizon-core = { path = "horizon-core" }
 winit = "0.30"
 wgpu = "22.1"
 pollster = "0.3"
@@ -21,3 +22,6 @@ env_logger = "0.11"
 [profile.release]
 opt-level = 3
 lto = "thin"
+
+[workspace]
+members = ["horizon-core"]

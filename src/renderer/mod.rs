@@ -9,8 +9,8 @@ use glam::Mat4;
 use wgpu::util::DeviceExt;
 use winit::window::Window;
 
-use crate::camera::OrbitCamera;
-use crate::orbit::Orbit;
+use horizon_core::frames::eci_to_world;
+use horizon_core::{OrbitCamera, World};
 use mesh::{MarkerInstance, VertexPC, VertexPN};
 
 // Natural Earth vector data, embedded so the binary is self-contained.
@@ -84,7 +84,7 @@ pub struct Renderer {
     marker_inst_buf: wgpu::Buffer,
 
     camera: OrbitCamera,
-    bodies: Vec<Orbit>,
+    world: World,
 }
 
 impl Renderer {
@@ -321,16 +321,19 @@ impl Renderer {
 
         // --- Orbiting bodies -------------------------------------------------
         let camera = OrbitCamera::default();
-        let bodies = crate::orbit::demo_bodies();
+        let world = World::demo();
 
-        // Static orbit paths (the body slides along them each frame).
+        // Static orbit paths (the body slides along them each frame). The orbit
+        // is computed in ECI/km, then mapped into the render frame.
         let mut track_verts: Vec<VertexPC> = Vec::new();
-        for body in &bodies {
+        for body in &world.bodies {
             let col = [body.color[0] * 0.85, body.color[1] * 0.85, body.color[2] * 0.85];
-            let pts = body.track(128);
+            let pts = body.orbit.sample_track(128);
             for w in pts.windows(2) {
-                track_verts.push(VertexPC { pos: w[0].to_array(), col });
-                track_verts.push(VertexPC { pos: w[1].to_array(), col });
+                let a = eci_to_world(w[0]).as_vec3().to_array();
+                let b = eci_to_world(w[1]).as_vec3().to_array();
+                track_verts.push(VertexPC { pos: a, col });
+                track_verts.push(VertexPC { pos: b, col });
             }
         }
         let track_vbuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -348,7 +351,7 @@ impl Renderer {
         // Filled each frame in `update`; one MarkerInstance per body.
         let marker_inst_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("marker-instances"),
-            size: (bodies.len().max(1) * std::mem::size_of::<MarkerInstance>()) as u64,
+            size: (world.bodies.len().max(1) * std::mem::size_of::<MarkerInstance>()) as u64,
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -378,7 +381,7 @@ impl Renderer {
             marker_quad_vbuf,
             marker_inst_buf,
             camera,
-            bodies,
+            world,
         }
     }
 
@@ -394,23 +397,26 @@ impl Renderer {
 
     /// Orbit the camera by pixel-scaled yaw/pitch deltas.
     pub fn orbit_camera(&mut self, dyaw: f32, dpitch: f32) {
-        self.camera.orbit(dyaw, dpitch);
+        self.camera.orbit(dyaw as f64, dpitch as f64);
     }
 
     /// Dolly the camera in (positive) or out (negative).
     pub fn zoom_camera(&mut self, factor: f32) {
-        self.camera.zoom(factor);
+        self.camera.zoom(factor as f64);
     }
 
-    /// Update camera + model transform and body positions for the given
-    /// elapsed time (seconds).
+    /// Advance the world clock and refresh per-frame GPU state for the given
+    /// real elapsed time (seconds).
     pub fn update(&mut self, time: f32) {
+        self.world.set_real_elapsed(time as f64);
+
         let aspect = self.config.width as f32 / self.config.height.max(1) as f32;
-        let view_proj = self.camera.view_proj(aspect);
-        let eye = self.camera.eye();
-        // The globe spins on its axis; orbiting bodies stay in the inertial
-        // frame, so they are not multiplied by this model matrix.
-        let model = Mat4::from_rotation_y(time * 0.12);
+        let view_proj = self.camera.view_proj(aspect as f64).as_mat4();
+        let eye = self.camera.eye().as_vec3();
+        // The Earth spins on its polar axis by the simulated rotation angle;
+        // bodies live in the inertial frame and are not multiplied by `model`.
+        let spin = self.world.earth_rotation().rem_euclid(std::f64::consts::TAU) as f32;
+        let model = Mat4::from_rotation_y(spin);
 
         let u = Uniforms {
             view_proj: view_proj.to_cols_array_2d(),
@@ -421,15 +427,14 @@ impl Renderer {
         self.queue
             .write_buffer(&self.uniform_buf, 0, bytemuck::cast_slice(&[u]));
 
-        // Refresh marker instances from the current orbit positions.
-        let instances: Vec<MarkerInstance> = self
-            .bodies
-            .iter()
-            .map(|b| {
-                let p = b.position(time);
+        // Refresh marker instances from the current orbit positions (ECI/km ->
+        // render frame).
+        let instances: Vec<MarkerInstance> = (0..self.world.bodies.len())
+            .map(|i| {
+                let p = eci_to_world(self.world.body_position_eci(i)).as_vec3();
                 MarkerInstance {
                     center_size: [p.x, p.y, p.z, MARKER_SIZE],
-                    color: b.color,
+                    color: self.world.bodies[i].color,
                     _pad: 0.0,
                 }
             })
@@ -507,7 +512,7 @@ impl Renderer {
 
             // Orbiting bodies (instanced billboards), drawn last so they read
             // crisply; still depth-tested so bodies behind the globe are hidden.
-            let body_count = self.bodies.len() as u32;
+            let body_count = self.world.bodies.len() as u32;
             if body_count > 0 {
                 rp.set_pipeline(&self.markers_pipeline);
                 rp.set_vertex_buffer(0, self.marker_quad_vbuf.slice(..));

@@ -12,11 +12,17 @@ Wayland desktops: clean vector graphics over photorealism.
 ## Status
 
 **Phase 1 (MVP) — done.** Fullscreen rotating globe, Natural Earth coastlines
-and country borders projected onto the sphere, atmospheric rim glow, starfield
+and country borders projected onto the sphere, atmospheric glow, starfield
 background, Nord palette, vsync-locked render loop, exit-on-activity.
 
-Upcoming: cities (Phase 2), ISS/satellite tracking (Phase 3+), screensaver
-integration (Phase 5).
+**In progress — world model & interaction.** Translucent globe with darker
+far-side lines; orbit camera (mouse drag + zoom); an engine-agnostic `f64`
+simulation core (`horizon-core`) with a sim clock, ECI/render frames, and
+Keplerian two-body satellite motion at real altitudes/periods, rendered as
+markers + orbit tracks.
+
+Upcoming: real epochs + GMST so ground tracks align to geography; SGP4 from
+CelesTrak TLEs; cities/labels (HUD); screensaver integration (Phase 5).
 
 ## Tech stack
 
@@ -26,7 +32,8 @@ integration (Phase 5).
 | Windowing  | **winit**       | See decision below |
 | Rendering  | wgpu (Metal/Vulkan) | |
 | Geo data   | Natural Earth   | `ne_110m` coastline + admin-0 countries, embedded |
-| Satellites | sgp4 (planned)  | from CelesTrak TLE |
+| Sim core   | `horizon-core`  | f64, units in km/s, ECI frame; render-agnostic |
+| Orbits     | Keplerian two-body | SGP4 + CelesTrak TLE planned |
 
 ### Windowing: winit, not GTK4
 
@@ -68,12 +75,19 @@ HORIZON_WINDOWED=1 HORIZON_NO_EXIT=1 cargo run
 
 ## Layout
 
+A Cargo workspace splits the engine-agnostic model from the renderer:
+
 ```
-src/
+horizon-core/        simulation core — pure f64, no rendering/windowing deps
+  src/
+    units.rs         physical constants (km, s, GM, Earth rotation rate)
+    frames.rs        ECI <-> render-frame bridge; lat/lon -> ECEF
+    orbit.rs         Keplerian two-body propagation + orbit-track sampling
+    camera.rs        orbit (arcball) camera: target/distance/yaw/pitch -> view
+    world.rs         sim clock + central-body rotation + orbiting bodies
+src/                 the app (depends on horizon-core)
   main.rs            entry point, CLI/env options, event loop setup
   app.rs             winit ApplicationHandler: window, input, camera control
-  camera.rs          orbit (arcball) camera: target/distance/yaw/pitch -> view
-  orbit.rs           orbiting bodies: circular-orbit model + demo satellites
   data/              minimal GeoJSON coordinate reader
   earth/             lat/lon -> sphere projection, line-segment building
   renderer/          wgpu surface, pipelines, per-frame draw
@@ -83,6 +97,11 @@ assets/
   shaders/           WGSL: starfield, globe, lines, track, markers, atmosphere
 cache/               runtime caches (later phases)
 ```
+
+`horizon-core` is the portability seam: it holds the physics (orbits, frames,
+time) in double precision and SI-ish units (km, s), with positions only mapped
+into the render frame (Y-up, Earth radius = 1) at the GPU boundary. Swapping the
+renderer later (or adding a backend) doesn't touch the model.
 
 ## Visual style (Nord)
 
@@ -133,9 +152,11 @@ The glow is driven by the view ray's closest approach to the globe centre (the
 
 | Knob | Where | Effect |
 |------|-------|--------|
-| `demo_bodies()` entries | `src/orbit.rs` | Per body: `radius` (altitude), `inclination`, `raan`, `period` (speed), `phase0`, `color`. |
+| `World::demo()` bodies | `horizon-core/src/world.rs` | Per body: name, `KeplerOrbit` (altitude/inclination/node/phase), colour. |
+| `DEFAULT_TIME_SCALE` | `horizon-core/src/world.rs` | Simulated seconds per real second (orbital speed). |
+| orbital elements / `circular(...)` | `horizon-core/src/orbit.rs` | Semi-major axis, eccentricity, inclination, RAAN, arg. periapsis, mean anomaly. |
 | `MARKER_SIZE` | `src/renderer/mod.rs` | On-screen marker size (NDC). |
-| `body.track(128)` | `src/renderer/mod.rs` | Orbit-track smoothness (segment count). |
+| `body.orbit.sample_track(128)` | `src/renderer/mod.rs` | Orbit-track smoothness (segment count). |
 | alpha `0.35` in `fs_main` | `assets/shaders/track.wgsl` | Orbit-track faintness. |
 | `smoothstep` / `core` | `assets/shaders/markers.wgsl` | Marker dot softness and core brightness. |
 
@@ -154,7 +175,7 @@ The glow is driven by the view ray's closest approach to the globe centre (the
 
 | Knob | Where | Effect |
 |------|-------|--------|
-| `time * 0.12` in `update` | `src/renderer/mod.rs` | Globe axial spin speed. |
+| `DEFAULT_TIME_SCALE` | `horizon-core/src/world.rs` | Globe spin is now physical (sidereal rate); this scales sim time, hence apparent spin + orbit speed together. |
 | `uv_sphere(64, 96, 1.0)` | `src/renderer/mod.rs` | Sphere tessellation (stacks, sectors). |
 | `COLOR_BG` | `src/renderer/mod.rs` | Background colour. |
 | `80.0` grid / `0.90` threshold | `assets/shaders/starfield.wgsl` | Star density and sparsity. |
