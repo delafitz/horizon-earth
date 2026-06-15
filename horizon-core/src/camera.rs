@@ -17,7 +17,8 @@ use crate::units::EARTH_RADIUS_KM;
 /// Keep the camera shy of the poles (gimbal degeneracy / flip).
 const PITCH_LIMIT: f64 = 1.5533; // ~89 degrees
 const DIST_MIN: f64 = 1.35;
-const DIST_MAX: f64 = 14.0;
+// ~9× Earth radii past the GEO ring; the far plane (200) leaves plenty of room.
+const DIST_MAX: f64 = 60.0;
 
 /// Map an ECI vector (Z-up) into the render frame (Y-up). Same rotation as
 /// [`crate::frames::eci_to_world`] minus the km->radius scale, for geometry
