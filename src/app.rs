@@ -14,7 +14,7 @@ use horizon_core::{Category, Epoch, World};
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::ActiveEventLoop;
-use winit::keyboard::{Key, NamedKey};
+use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{Fullscreen, Window, WindowId};
 
 use crate::renderer::{EguiFrame, Renderer};
@@ -64,8 +64,6 @@ pub struct App {
     time_mode: TimeMode,
     group: String,
     offline: bool,
-    /// If set, the initial random-subset size shown from the group.
-    sample: Option<usize>,
     /// All element sets loaded for the group; re-sampled (per type) when a
     /// panel slider changes a type's shown count.
     elements: Vec<horizon_core::Elements>,
@@ -74,6 +72,8 @@ pub struct App {
     element_cats: Vec<Option<Category>>,
     last_cursor: Option<(f64, f64)>,
     dragging: bool,
+    /// Current keyboard modifiers, tracked for trackpad scroll gestures.
+    modifiers: ModifiersState,
     no_exit: bool,
     windowed: bool,
 
@@ -87,14 +87,7 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(
-        windowed: bool,
-        no_exit: bool,
-        demo: bool,
-        group: String,
-        offline: bool,
-        sample: Option<usize>,
-    ) -> Self {
+    pub fn new(windowed: bool, no_exit: bool, demo: bool, group: String, offline: bool) -> Self {
         Self {
             window: None,
             renderer: None,
@@ -103,11 +96,11 @@ impl App {
             time_mode: if demo { TimeMode::Demo } else { TimeMode::Live },
             group,
             offline,
-            sample,
             elements: Vec::new(),
             element_cats: Vec::new(),
             last_cursor: None,
             dragging: false,
+            modifiers: ModifiersState::empty(),
             no_exit,
             windowed,
             egui_ctx: egui::Context::default(),
@@ -384,14 +377,8 @@ impl ApplicationHandler for App {
         // Load + classify the group once; the per-type sliders re-sample live.
         self.elements = self.load_elements();
         self.element_cats = classify_elements(&self.elements);
-        // A `--sample N` flag seeds every type's initial cap (clamped to the
-        // slider max); otherwise each type keeps its default cap.
-        if let Some(n) = self.sample {
-            let cap = n.min(crate::ui::MAX_SAMPLE);
-            for t in self.ui.settings.types.iter_mut() {
-                t.max_shown = cap;
-            }
-        }
+        // Each type keeps its default cap; the per-type "max shown" sliders are
+        // the sole control over how many of each category are shown.
         let caps = self.type_caps();
         let world = self.world_from_caps(&caps);
         let renderer = pollster::block_on(Renderer::new(window.clone(), world));
@@ -450,17 +437,33 @@ impl ApplicationHandler for App {
                 }
             }
 
+            WindowEvent::ModifiersChanged(m) => {
+                self.modifiers = m.state();
+            }
+
             WindowEvent::MouseWheel { delta, .. } => {
                 if self.no_exit {
                     if egui_consumed {
-                        return; // scrolling a panel/list, not zooming the globe
+                        return; // scrolling a panel/list, not navigating the globe
                     }
-                    let y = match delta {
-                        MouseScrollDelta::LineDelta(_, y) => y,
-                        MouseScrollDelta::PixelDelta(p) => p.y as f32 / 50.0,
+                    // Trackpad/wheel deltas in roughly pixel units.
+                    let (dx, dy) = match delta {
+                        MouseScrollDelta::LineDelta(x, y) => (x * 8.0, y * 8.0),
+                        MouseScrollDelta::PixelDelta(p) => (p.x as f32, p.y as f32),
                     };
+                    let mods = self.modifiers;
                     if let Some(r) = self.renderer.as_mut() {
-                        r.zoom_camera(y * 0.1); // scroll up = zoom in
+                        // Fixed/realtime mode only; fly mode is keyboard-driven.
+                        if !r.is_fly_mode() {
+                            const ROT: f32 = 0.005; // rad per pixel
+                            if mods.control_key() {
+                                r.zoom_camera(dy * 0.002); // Ctrl: scroll up = zoom in
+                            } else if mods.shift_key() {
+                                r.orbit_camera(-dx * ROT, dy * ROT); // Shift: orbit camera
+                            } else {
+                                r.spin_earth(dx * ROT, dy * ROT); // plain: spin the globe
+                            }
+                        }
                     }
                 } else {
                     event_loop.exit();

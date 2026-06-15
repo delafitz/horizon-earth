@@ -110,14 +110,23 @@ impl RenderSettings {
         }
     }
 
+    /// Whether category `cat` is shown at all. The per-type `visible` checkbox
+    /// is a master switch: when off, every artifact for that type — markers,
+    /// HUD labels, orbit tracks and ground anchors — is suppressed.
+    pub fn type_visible(&self, cat: Category) -> bool {
+        self.ty(cat).visible
+    }
+
     /// Whether HUD labels for category `cat` should be drawn.
     pub fn label_visible(&self, cat: Category) -> bool {
         self.ty(cat).visible
     }
 
-    /// Whether orbit tracks for category `cat` should be drawn.
+    /// Whether orbit tracks for category `cat` should be drawn (hidden types
+    /// suppress tracks regardless of the per-type track toggle).
     pub fn track_visible(&self, cat: Category) -> bool {
-        self.ty(cat).show_track
+        let t = self.ty(cat);
+        t.visible && t.show_track
     }
 
     /// Bitmask (one bit per [`CATEGORIES`] slot) of which types show orbit
@@ -125,7 +134,7 @@ impl RenderSettings {
     pub fn track_mask(&self) -> u32 {
         let mut m = 0;
         for (i, t) in self.types.iter().enumerate() {
-            if t.show_track {
+            if t.visible && t.show_track {
                 m |= 1 << i;
             }
         }
@@ -178,13 +187,15 @@ impl Default for TypeStyle {
             symbol: Symbol::Auto,
             size: 1.0,
             show_track: true,
-            max_shown: MAX_SAMPLE,
+            max_shown: DEFAULT_SHOWN,
         }
     }
 }
 
+/// Default per-type "max shown" cap (out-of-box load).
+pub const DEFAULT_SHOWN: usize = 100;
 /// Upper bound of the per-type "max shown" slider.
-pub const MAX_SAMPLE: usize = 200;
+pub const MAX_SAMPLE: usize = 300;
 
 /// The categories shown (in order) in the per-type symbol editor.
 pub const CATEGORIES: [Category; 6] = [
