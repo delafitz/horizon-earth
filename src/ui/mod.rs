@@ -80,7 +80,7 @@ impl Default for RenderSettings {
             border_visible: true,
             border_width: 1.4,
             cities_show: true,
-            cities_min_pop: 250_000.0,
+            cities_min_pop: 100_000.0,
             cities_alpha: 0.85,
             cities_labels: false,
             show_atmosphere: true,
