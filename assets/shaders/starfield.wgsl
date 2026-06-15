@@ -13,7 +13,9 @@ fn vs_main(@builtin(vertex_index) vi: u32) -> VOut {
     let x = f32((vi << 1u) & 2u);
     let y = f32(vi & 2u);
     o.uv = vec2<f32>(x, y);
-    o.clip = vec4<f32>(x * 2.0 - 1.0, y * 2.0 - 1.0, 0.0, 1.0);
+    // Far plane (NDC z = 1.0) so the depth-writing globe occludes the stars
+    // behind it instead of them showing through the translucent surface.
+    o.clip = vec4<f32>(x * 2.0 - 1.0, y * 2.0 - 1.0, 1.0, 1.0);
     return o;
 }
 

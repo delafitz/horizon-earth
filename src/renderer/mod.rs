@@ -355,10 +355,12 @@ impl Renderer {
             },
         };
 
+        // Far-plane background: depth-tested so the globe (which writes depth)
+        // occludes stars behind it. Drawn after the globe in `render`.
         let starfield_pipeline = make_pipeline(
             &device, &pipeline_layout, &starfield_sh, format, &[],
             wgpu::PrimitiveTopology::TriangleList, None, false,
-            wgpu::CompareFunction::Always, "fs_main",
+            wgpu::CompareFunction::LessEqual, "fs_main",
         );
         let globe_pipeline = make_pipeline(
             &device, &pipeline_layout, &globe_sh, format, &[pn_layout],
@@ -1229,15 +1231,16 @@ impl Renderer {
             // Land mask reference: the fill writes this value, cities test for it.
             rp.set_stencil_reference(STENCIL_LAND);
 
-            // Background stars.
-            rp.set_pipeline(&self.starfield_pipeline);
-            rp.draw(0..3, 0..1);
-
-            // Solid globe.
+            // Solid globe first so it writes depth.
             rp.set_pipeline(&self.globe_pipeline);
             rp.set_vertex_buffer(0, self.sphere_vbuf.slice(..));
             rp.set_index_buffer(self.sphere_ibuf.slice(..), wgpu::IndexFormat::Uint32);
             rp.draw_indexed(0..self.sphere_icount, 0, 0..1);
+
+            // Background stars at the far plane: depth-tested, so they're
+            // occluded by the globe (no stars showing through the Earth).
+            rp.set_pipeline(&self.starfield_pipeline);
+            rp.draw(0..3, 0..1);
 
             let body_count = self.world.bodies.len() as u32;
 

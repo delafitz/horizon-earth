@@ -71,7 +71,7 @@ impl Default for RenderSettings {
             sat_back_alpha: 0.4,
             ground_width: 1.5,
             ground_alpha: 0.5,
-            types: [TypeStyle::default(); CATEGORIES.len()],
+            types: default_types(),
             line_brightness: 1.0,
             line_back_alpha: 0.28,
             fill_alpha: 0.20,
@@ -207,6 +207,16 @@ impl Default for TypeStyle {
 pub const DEFAULT_SHOWN: usize = 100;
 /// Upper bound of the per-type "max shown" slider.
 pub const MAX_SAMPLE: usize = 300;
+
+/// Default per-type styles: only crewed stations start visible; the rest are
+/// toggled on from the panel as wanted (keeps the out-of-box view uncluttered).
+fn default_types() -> [TypeStyle; CATEGORIES.len()] {
+    let mut types = [TypeStyle::default(); CATEGORIES.len()];
+    for (i, t) in types.iter_mut().enumerate() {
+        t.visible = CATEGORIES[i] == Category::Station;
+    }
+    types
+}
 
 /// The categories shown (in order) in the per-type symbol editor.
 pub const CATEGORIES: [Category; 6] = [
