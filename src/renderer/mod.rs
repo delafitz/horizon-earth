@@ -48,8 +48,8 @@ const COLOR_CITY: [f32; 3] = [0.533, 0.753, 0.816]; // Nord8 frost blue — city
 // Cities: small filled-circle markers on the surface (kind 3 in markers.wgsl).
 // Dot size and brightness scale with population (log), like city lights.
 const CITY_RADIUS: f32 = 1.004; // just above the surface / land fill
-const CITY_SIZE_MIN: f32 = 0.003; // on-screen half-size (NDC) for small towns
-const CITY_SIZE_MAX: f32 = 0.012; // ... up to the largest megacities
+const CITY_SIZE_MIN: f32 = 0.0025; // on-screen half-size (NDC) for small towns
+const CITY_SIZE_MAX: f32 = 0.015; // ... up to the largest megacities
 // Population (log10) mapped to the [0,1] size ramp: ~100k -> 0, ~20M -> 1.
 const CITY_LOG_MIN: f32 = 5.0;
 const CITY_LOG_MAX: f32 = 7.3;
@@ -979,13 +979,25 @@ impl Renderer {
                     // Population (log) -> [0,1] ramp driving the dot size. Colour
                     // stays the full city colour (intensity is day/night, in the
                     // shader) so dots don't tint dark with population.
-                    let t = ((c.pop.max(1.0).log10() - CITY_LOG_MIN)
+                    let mut t = ((c.pop.max(1.0).log10() - CITY_LOG_MIN)
                         / (CITY_LOG_MAX - CITY_LOG_MIN))
                         .clamp(0.0, 1.0);
+                    // Gentle S-curve so the low end shrinks/fades and the high
+                    // end grows/intensifies (a touch more non-linear than log).
+                    t = t * t * (3.0 - 2.0 * t);
                     let size = CITY_SIZE_MIN + t * (CITY_SIZE_MAX - CITY_SIZE_MIN);
+                    // Per-city brightness ~0.7x (small) -> ~1.2x (mega): the city
+                    // instance has no per-dot alpha, so intensity rides the
+                    // colour magnitude (dimmer reads as fainter over the Earth).
+                    let intensity = 0.7 + t * 0.5;
+                    let color = [
+                        COLOR_CITY[0] * intensity,
+                        COLOR_CITY[1] * intensity,
+                        COLOR_CITY[2] * intensity,
+                    ];
                     MarkerInstance {
                         center_size: [p.x, p.y, p.z, size],
-                        color: COLOR_CITY,
+                        color,
                         kind: 3.0,
                     }
                 })

@@ -73,14 +73,14 @@ impl Default for RenderSettings {
             ground_alpha: 0.5,
             types: default_types(),
             line_brightness: 1.0,
-            line_back_alpha: 0.28,
-            fill_alpha: 0.20,
+            line_back_alpha: 0.1,
+            fill_alpha: 0.35,
             coast_visible: true,
             coast_width: 2.0,
             border_visible: true,
             border_width: 1.4,
             cities_show: true,
-            cities_min_pop: 500_000.0,
+            cities_min_pop: 250_000.0,
             cities_alpha: 0.85,
             cities_labels: false,
             show_atmosphere: true,
@@ -412,8 +412,7 @@ fn properties_panel(ctx: &Context, ui: &mut UiState, world: &World) {
             });
             p.add_enabled(
                 !ui.live,
-                egui::Slider::new(&mut ui.time_scale, 1.0..=5000.0)
-                    .logarithmic(true)
+                egui::Slider::new(&mut ui.time_scale, 100.0..=1000.0)
                     .text("sim ×"),
             );
 
@@ -528,8 +527,7 @@ fn properties_panel(ctx: &Context, ui: &mut UiState, world: &World) {
                     c.checkbox(&mut s.cities_show, "visible");
                     c.add_enabled_ui(s.cities_show, |c| {
                         c.add(
-                            egui::Slider::new(&mut s.cities_min_pop, 500.0..=35_000_000.0)
-                                .logarithmic(true)
+                            egui::Slider::new(&mut s.cities_min_pop, 100_000.0..=50_000_000.0)
                                 .text("min population"),
                         );
                         c.add(egui::Slider::new(&mut s.cities_alpha, 0.0..=1.0).text("opacity"));
