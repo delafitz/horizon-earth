@@ -39,7 +39,7 @@ const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 const COLOR_COAST: [f32; 3] = [0.533, 0.753, 0.816]; // Nord8 #88C0D0
 const COLOR_BORDER: [f32; 3] = [0.298, 0.337, 0.416]; // Nord3 #4C566A
 const COLOR_LAND: [f32; 3] = [0.263, 0.298, 0.369]; // Nord3-ish land fill (low alpha)
-const COLOR_CITY: [f32; 3] = [0.922, 0.796, 0.545]; // Nord13 yellow — city dots
+const COLOR_CITY: [f32; 3] = [0.533, 0.753, 0.816]; // Nord8 frost blue — city dots
 // Cities: small filled-circle markers on the surface (kind 3 in markers.wgsl).
 // Dot size and brightness scale with population (log), like city lights.
 const CITY_RADIUS: f32 = 1.004; // just above the surface / land fill
@@ -462,15 +462,43 @@ impl Renderer {
             Some(wgpu::BlendState::ALPHA_BLENDING), false,
             wgpu::CompareFunction::Greater, "fs_back",
         );
-        // Cities: surface billboards, near side only (depth LessEqual occludes
-        // those behind the globe), scaled by the city opacity in `fs_city`.
-        let city_pipeline = make_pipeline(
-            &device, &pipeline_layout, &markers_sh, format,
-            &[corner_layout.clone(), inst_layout.clone()],
-            wgpu::PrimitiveTopology::TriangleList,
-            Some(wgpu::BlendState::ALPHA_BLENDING), false,
-            wgpu::CompareFunction::LessEqual, "fs_city",
-        );
+        // Cities: dots laid flat on the surface (tangent plane, via vs_surface),
+        // near side only (depth LessEqual occludes those behind the globe),
+        // scaled by the city opacity in fs_city.
+        let city_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("cities"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &markers_sh,
+                entry_point: "vs_surface",
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                buffers: &[corner_layout.clone(), inst_layout.clone()],
+            },
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: false,
+                depth_compare: wgpu::CompareFunction::LessEqual,
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &markers_sh,
+                entry_point: "fs_city",
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            multiview: None,
+            cache: None,
+        });
         let markers_pipeline = make_pipeline(
             &device, &pipeline_layout, &markers_sh, format, &[corner_layout, inst_layout],
             wgpu::PrimitiveTopology::TriangleList,

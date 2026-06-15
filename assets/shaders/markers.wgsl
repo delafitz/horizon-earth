@@ -42,6 +42,35 @@ fn vs_main(
     return o;
 }
 
+// Surface-laid variant (cities): the quad lies in the tangent plane at `center`,
+// oriented by the surface normal (radial), so dots hug the globe and foreshorten
+// toward the limb instead of always facing the camera. `size` is in world units.
+@vertex
+fn vs_surface(
+    @location(0) corner: vec2<f32>,
+    @location(1) center_size: vec4<f32>,
+    @location(2) color_kind: vec4<f32>,
+) -> VOut {
+    let center = center_size.xyz;
+    let size = center_size.w;
+
+    let n = normalize(center); // outward surface normal
+    var up = vec3<f32>(0.0, 1.0, 0.0);
+    if (abs(n.y) > 0.99) {
+        up = vec3<f32>(1.0, 0.0, 0.0);
+    }
+    let t = normalize(cross(up, n)); // tangent basis in the surface plane
+    let b = cross(n, t);
+    let world = center + (corner.x * t + corner.y * b) * size;
+
+    var o: VOut;
+    o.clip = u.view_proj * vec4<f32>(world, 1.0);
+    o.uv = corner;
+    o.color = color_kind.xyz;
+    o.kind = color_kind.w;
+    return o;
+}
+
 // Distance from point `p` to segment `a`-`b`.
 fn seg_dist(p: vec2<f32>, a: vec2<f32>, b: vec2<f32>) -> f32 {
     let pa = p - a;
