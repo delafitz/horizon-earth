@@ -60,8 +60,11 @@ fn triangle_alpha(uv: vec2<f32>) -> f32 {
 }
 
 // Marker coverage at corner `uv` for the given kind: 0 = outline box, 1 = filled
-// square (solid with a soft edge), 2 = wire triangle.
+// square (solid with a soft edge), 2 = wire triangle, 3 = filled circle (cities).
 fn marker_alpha(uv: vec2<f32>, kind: f32) -> f32 {
+    if (kind > 2.5) {
+        return 1.0 - smoothstep(0.78, 1.0, length(uv)); // filled circle
+    }
     if (kind > 1.5) {
         return triangle_alpha(uv);
     }
@@ -91,4 +94,14 @@ fn fs_back(in: VOut) -> @location(0) vec4<f32> {
         discard;
     }
     return vec4<f32>(in.color * 0.7, a);
+}
+
+// City markers: same shapes, scaled by the city opacity (style2.w).
+@fragment
+fn fs_city(in: VOut) -> @location(0) vec4<f32> {
+    let a = marker_alpha(in.uv, in.kind) * u.style2.w;
+    if (a < 0.02) {
+        discard;
+    }
+    return vec4<f32>(in.color, a);
 }

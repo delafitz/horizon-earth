@@ -50,6 +50,15 @@ pub struct RenderSettings {
     /// Country-border stroke width in pixels.
     pub border_width: f32,
 
+    // --- Cities ---
+    pub cities_show: bool,
+    /// Minimum population for a city to be drawn.
+    pub cities_min_pop: f32,
+    /// City marker + label opacity.
+    pub cities_alpha: f32,
+    /// Whether city name labels are shown.
+    pub cities_labels: bool,
+
     // --- Atmosphere ---
     pub show_atmosphere: bool,
     /// Glow strength.
@@ -77,6 +86,10 @@ impl Default for RenderSettings {
             coast_width: 2.0,
             border_visible: true,
             border_width: 1.4,
+            cities_show: true,
+            cities_min_pop: 500_000.0,
+            cities_alpha: 0.85,
+            cities_labels: false,
             show_atmosphere: true,
             atmo_intensity: 0.45,
             atmo_thickness: 0.06,
@@ -508,6 +521,21 @@ fn properties_panel(ctx: &Context, ui: &mut UiState, world: &World) {
                                 egui::Slider::new(&mut s.border_width, 0.5..=6.0).text("width px"),
                             );
                         });
+                });
+
+            egui::CollapsingHeader::new("Cities")
+                .default_open(false)
+                .show(p, |c| {
+                    c.checkbox(&mut s.cities_show, "visible");
+                    c.add_enabled_ui(s.cities_show, |c| {
+                        c.add(
+                            egui::Slider::new(&mut s.cities_min_pop, 500.0..=35_000_000.0)
+                                .logarithmic(true)
+                                .text("min population"),
+                        );
+                        c.add(egui::Slider::new(&mut s.cities_alpha, 0.0..=1.0).text("opacity"));
+                        c.checkbox(&mut s.cities_labels, "labels");
+                    });
                 });
 
             egui::CollapsingHeader::new("Atmosphere")

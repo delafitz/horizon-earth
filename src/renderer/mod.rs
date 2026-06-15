@@ -30,6 +30,8 @@ pub struct EguiFrame<'a> {
 const COASTLINE_GEOJSON: &str = include_str!("../../assets/earth/ne_110m_coastline.geojson");
 const COUNTRIES_GEOJSON: &str =
     include_str!("../../assets/earth/ne_110m_admin_0_countries.geojson");
+const CITIES_GEOJSON: &str =
+    include_str!("../../assets/earth/ne_10m_populated_places.geojson");
 
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 
@@ -37,6 +39,16 @@ const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 const COLOR_COAST: [f32; 3] = [0.533, 0.753, 0.816]; // Nord8 #88C0D0
 const COLOR_BORDER: [f32; 3] = [0.298, 0.337, 0.416]; // Nord3 #4C566A
 const COLOR_LAND: [f32; 3] = [0.263, 0.298, 0.369]; // Nord3-ish land fill (low alpha)
+const COLOR_CITY: [f32; 3] = [0.922, 0.796, 0.545]; // Nord13 yellow — city dots
+// Cities: small filled-circle markers on the surface (kind 3 in markers.wgsl).
+// Dot size and brightness scale with population (log), like city lights.
+const CITY_RADIUS: f32 = 1.004; // just above the surface / land fill
+const CITY_SIZE_MIN: f32 = 0.003; // on-screen half-size (NDC) for small towns
+const CITY_SIZE_MAX: f32 = 0.012; // ... up to the largest megacities
+const CITY_INTENSITY_MIN: f32 = 0.4; // colour scale for the dimmest cities
+// Population (log10) mapped to the [0,1] size/intensity ramp: ~100k -> 0, ~20M -> 1.
+const CITY_LOG_MIN: f32 = 5.0;
+const CITY_LOG_MAX: f32 = 7.3;
 // Land-fill curvature tolerance: the max angle (degrees) a fill triangle edge
 // may span before it's subdivided and snapped to the sphere. Smaller = smoother
 // fill that hugs the curve (more triangles), larger = flatter/cheaper. ~2° keeps
@@ -99,6 +111,14 @@ struct Uniforms {
     // z = far-side alpha for satellite layers (tracks/markers/ground)
 }
 
+/// A city kept for rendering: earth-fixed position (spins with the globe) plus
+/// its name and population (for the label / population-threshold filter).
+struct CityPoint {
+    name: String,
+    pos: Vec3,
+    pop: f32,
+}
+
 pub struct Renderer {
     surface: wgpu::Surface<'static>,
     device: wgpu::Device,
@@ -147,6 +167,13 @@ pub struct Renderer {
 
     marker_quad_vbuf: wgpu::Buffer,
     marker_inst_buf: wgpu::Buffer,
+
+    // Cities: static earth-fixed list; marker instances rebuilt each frame
+    // (rotated by GMST, filtered by population) and drawn with the circle symbol.
+    cities: Vec<CityPoint>,
+    city_pipeline: wgpu::RenderPipeline,
+    city_inst_buf: wgpu::Buffer,
+    city_count: u32,
 
     camera: CameraRig,
     world: World,
@@ -435,6 +462,15 @@ impl Renderer {
             Some(wgpu::BlendState::ALPHA_BLENDING), false,
             wgpu::CompareFunction::Greater, "fs_back",
         );
+        // Cities: surface billboards, near side only (depth LessEqual occludes
+        // those behind the globe), scaled by the city opacity in `fs_city`.
+        let city_pipeline = make_pipeline(
+            &device, &pipeline_layout, &markers_sh, format,
+            &[corner_layout.clone(), inst_layout.clone()],
+            wgpu::PrimitiveTopology::TriangleList,
+            Some(wgpu::BlendState::ALPHA_BLENDING), false,
+            wgpu::CompareFunction::LessEqual, "fs_city",
+        );
         let markers_pipeline = make_pipeline(
             &device, &pipeline_layout, &markers_sh, format, &[corner_layout, inst_layout],
             wgpu::PrimitiveTopology::TriangleList,
@@ -625,6 +661,24 @@ impl Renderer {
             mapped_at_creation: false,
         });
 
+        // Cities: parse once into earth-fixed positions; marker instances are
+        // rebuilt each frame (rotated by GMST, filtered by population).
+        let cities: Vec<CityPoint> = crate::data::extract_cities(CITIES_GEOJSON)
+            .into_iter()
+            .map(|c| CityPoint {
+                pos: Vec3::from_array(crate::earth::latlon_to_xyz(c.lon, c.lat, CITY_RADIUS)),
+                name: c.name,
+                pop: c.pop as f32,
+            })
+            .collect();
+        log::info!("loaded {} cities", cities.len());
+        let city_inst_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("city-instances"),
+            size: (cities.len().max(1) * std::mem::size_of::<MarkerInstance>()) as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
         // One nadir line + a footprint ring per body, refilled in `update`.
         let ground_per_body = 1 + RING_SEGMENTS;
         let ground_inst_buf = device.create_buffer(&wgpu::BufferDescriptor {
@@ -676,6 +730,10 @@ impl Renderer {
             track_vcount,
             marker_quad_vbuf,
             marker_inst_buf,
+            cities,
+            city_pipeline,
+            city_inst_buf,
+            city_count: 0,
             camera,
             world,
             egui_renderer,
@@ -828,7 +886,7 @@ impl Renderer {
                 s.coast_width_px(),
                 s.border_width_px(),
             ],
-            style2: [s.ground_width_px(), s.ground_alpha, s.sat_back_alpha, 0.0],
+            style2: [s.ground_width_px(), s.ground_alpha, s.sat_back_alpha, s.cities_alpha],
         };
         self.queue
             .write_buffer(&self.uniform_buf, 0, bytemuck::cast_slice(&[u]));
@@ -856,6 +914,37 @@ impl Renderer {
             .collect();
         self.queue
             .write_buffer(&self.marker_inst_buf, 0, bytemuck::cast_slice(&instances));
+
+        // City markers: earth-fixed dots rotated into the inertial frame by GMST,
+        // filtered by the population threshold. Opacity rides style2.w (fs_city).
+        let city_rot = glam::Mat3::from_rotation_y(spin);
+        let city_insts: Vec<MarkerInstance> = if self.settings.cities_show {
+            self.cities
+                .iter()
+                .filter(|c| c.pop >= self.settings.cities_min_pop)
+                .map(|c| {
+                    let p = city_rot * c.pos;
+                    // Population (log) -> [0,1] ramp driving size and brightness.
+                    let t = ((c.pop.max(1.0).log10() - CITY_LOG_MIN)
+                        / (CITY_LOG_MAX - CITY_LOG_MIN))
+                        .clamp(0.0, 1.0);
+                    let size = CITY_SIZE_MIN + t * (CITY_SIZE_MAX - CITY_SIZE_MIN);
+                    let glow = CITY_INTENSITY_MIN + t * (1.0 - CITY_INTENSITY_MIN);
+                    MarkerInstance {
+                        center_size: [p.x, p.y, p.z, size],
+                        color: [COLOR_CITY[0] * glow, COLOR_CITY[1] * glow, COLOR_CITY[2] * glow],
+                        kind: 3.0,
+                    }
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        self.city_count = city_insts.len() as u32;
+        if !city_insts.is_empty() {
+            self.queue
+                .write_buffer(&self.city_inst_buf, 0, bytemuck::cast_slice(&city_insts));
+        }
 
         // Ground anchors: a nadir drop-line + footprint ring per body, in the
         // body's category colour. Built in the inertial frame like the markers,
@@ -925,6 +1014,9 @@ impl Renderer {
         }
         if self.settings.show_labels {
             verts.extend(self.build_labels(view_proj, eye, width, height));
+        }
+        if self.settings.cities_show && self.settings.cities_labels {
+            self.build_city_labels(view_proj, eye, spin, width, height, &mut verts);
         }
         verts.truncate(MAX_LABEL_VERTS);
         self.label_vcount = verts.len() as u32;
@@ -1007,6 +1099,61 @@ impl Renderer {
             }
         }
         out
+    }
+
+    /// Append city name labels (above the population threshold, front-facing),
+    /// decluttered nearest-first. Appends to the shared label vertex list.
+    fn build_city_labels(
+        &self,
+        view_proj: Mat4,
+        eye: Vec3,
+        spin: f32,
+        width: f32,
+        height: f32,
+        out: &mut Vec<mesh::LabelVertex>,
+    ) {
+        let unit = (LABEL_PX * 0.7) / glyphs::GH; // a touch smaller than body labels
+        let off_x = 6.0;
+        let min_sep = LABEL_PX * 1.2;
+        let rot = glam::Mat3::from_rotation_y(spin);
+        let min_pop = self.settings.cities_min_pop;
+
+        let mut cands: Vec<(f32, [f32; 2], usize)> = Vec::new();
+        for (i, c) in self.cities.iter().enumerate() {
+            if c.pop < min_pop {
+                continue;
+            }
+            let p = rot * c.pos;
+            if occluded_by_globe(eye, p) {
+                continue;
+            }
+            let clip = view_proj * Vec4::new(p.x, p.y, p.z, 1.0);
+            if clip.w <= 0.0 {
+                continue;
+            }
+            let nx = clip.x / clip.w;
+            let ny = clip.y / clip.w;
+            if nx.abs() > 1.1 || ny.abs() > 1.1 {
+                continue;
+            }
+            let px = [(nx * 0.5 + 0.5) * width, (1.0 - (ny * 0.5 + 0.5)) * height];
+            cands.push(((p - eye).length(), px, i));
+        }
+        cands.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+
+        let mut placed: Vec<[f32; 2]> = Vec::new();
+        for (_, px, i) in cands {
+            if placed.iter().any(|q| (q[0] - px[0]).hypot(q[1] - px[1]) < min_sep) {
+                continue;
+            }
+            placed.push(px);
+            let ox = px[0] + off_x;
+            let oy = px[1] - LABEL_PX * 0.35;
+            emit_text(out, &self.cities[i].name, ox, oy, COLOR_CITY, unit, width, height);
+            if out.len() + 256 > MAX_LABEL_VERTS {
+                break;
+            }
+        }
     }
 
     pub fn render(&mut self, egui: Option<EguiFrame>) -> Result<(), wgpu::SurfaceError> {
@@ -1124,6 +1271,14 @@ impl Renderer {
                 rp.set_vertex_buffer(0, self.sphere_vbuf.slice(..));
                 rp.set_index_buffer(self.sphere_ibuf.slice(..), wgpu::IndexFormat::Uint32);
                 rp.draw_indexed(0..self.sphere_icount, 0, 0..1);
+            }
+
+            // City dots on the surface (near side; the globe occludes the back).
+            if self.city_count > 0 {
+                rp.set_pipeline(&self.city_pipeline);
+                rp.set_vertex_buffer(0, self.marker_quad_vbuf.slice(..));
+                rp.set_vertex_buffer(1, self.city_inst_buf.slice(..));
+                rp.draw(0..6, 0..self.city_count);
             }
 
             // Bodies in front, drawn last so they read crisply.

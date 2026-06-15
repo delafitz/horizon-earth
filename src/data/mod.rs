@@ -11,6 +11,59 @@ use serde_json::Value;
 /// A single open polyline of `[lon, lat]` points (degrees).
 pub type PolyLine = Vec<[f64; 2]>;
 
+/// A populated place: name, position (degrees) and max population.
+pub struct City {
+    pub name: String,
+    pub lon: f64,
+    pub lat: f64,
+    pub pop: f64,
+}
+
+/// Parse a GeoJSON FeatureCollection of `Point` features (Natural Earth
+/// populated places) into [`City`] records, reading `name` and `pop_max`.
+/// Features missing a name or coordinates are skipped.
+pub fn extract_cities(geojson: &str) -> Vec<City> {
+    let root: Value = match serde_json::from_str(geojson) {
+        Ok(v) => v,
+        Err(e) => {
+            log::error!("failed to parse cities GeoJSON: {e}");
+            return Vec::new();
+        }
+    };
+    let Some(features) = root.get("features").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+
+    let mut out = Vec::new();
+    for feature in features {
+        let props = feature.get("properties");
+        let geom = feature.get("geometry");
+        let coords = geom
+            .filter(|g| g.get("type").and_then(Value::as_str) == Some("Point"))
+            .and_then(|g| g.get("coordinates"))
+            .and_then(Value::as_array);
+        let (Some(coords), Some(props)) = (coords, props) else {
+            continue;
+        };
+        let (Some(lon), Some(lat)) = (
+            coords.first().and_then(Value::as_f64),
+            coords.get(1).and_then(Value::as_f64),
+        ) else {
+            continue;
+        };
+        let Some(name) = props
+            .get("name")
+            .or_else(|| props.get("nameascii"))
+            .and_then(Value::as_str)
+        else {
+            continue;
+        };
+        let pop = props.get("pop_max").and_then(Value::as_f64).unwrap_or(0.0);
+        out.push(City { name: name.to_string(), lon, lat, pop });
+    }
+    out
+}
+
 /// Parse a GeoJSON FeatureCollection and return every coordinate ring as a
 /// flat list of polylines.
 pub fn extract_polylines(geojson: &str) -> Vec<PolyLine> {
