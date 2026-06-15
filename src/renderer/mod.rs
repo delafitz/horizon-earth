@@ -149,10 +149,6 @@ pub struct Renderer {
     marker_inst_buf: wgpu::Buffer,
 
     camera: CameraRig,
-    // Manual "spin the globe" offsets (radians) layered on the GMST rotation;
-    // driven by the trackpad in Fixed mode. Rotates the geography only.
-    earth_yaw: f32,
-    earth_pitch: f32,
     world: World,
 
     // [egui] overlay painter + the live parameter values the UI drives.
@@ -681,8 +677,6 @@ impl Renderer {
             marker_quad_vbuf,
             marker_inst_buf,
             camera,
-            earth_yaw: 0.0,
-            earth_pitch: 0.0,
             world,
             egui_renderer,
             settings: RenderSettings::default(),
@@ -762,14 +756,6 @@ impl Renderer {
         self.camera.orbit.zoom(factor as f64);
     }
 
-    /// Spin the globe in place: `dyaw` about the polar axis (longitude), `dpitch`
-    /// tilts latitude. Rotates the geography only — satellites stay inertial.
-    pub fn spin_earth(&mut self, dyaw: f32, dpitch: f32) {
-        use std::f32::consts::{PI, TAU};
-        self.earth_yaw = (self.earth_yaw + dyaw).rem_euclid(TAU);
-        // Clamp the tilt so the globe can't flip past the poles.
-        self.earth_pitch = (self.earth_pitch + dpitch).clamp(-0.5 * PI, 0.5 * PI);
-    }
 
     /// Toggle between the Fixed (Earth-centred) and Fly (orbit-riding) cameras.
     pub fn toggle_camera(&mut self) {
@@ -825,12 +811,8 @@ impl Renderer {
         let eye = self.camera.eye().as_vec3();
         // The Earth's orientation is GMST(now): the rotation carrying the
         // Earth-fixed coastlines into the inertial frame the satellites live in.
-        // The manual earth_yaw/earth_pitch offsets (trackpad "spin the globe")
-        // are layered on top — they turn the geography only; satellites, tracks
-        // and ground anchors stay in the inertial frame (see the unspin below).
         let spin = self.world.earth_rotation().rem_euclid(std::f64::consts::TAU) as f32;
-        let model = Mat4::from_rotation_x(self.earth_pitch)
-            * Mat4::from_rotation_y(spin + self.earth_yaw);
+        let model = Mat4::from_rotation_y(spin);
 
         let s = &self.settings;
         let u = Uniforms {
@@ -877,10 +859,9 @@ impl Renderer {
 
         // Ground anchors: a nadir drop-line + footprint ring per body, in the
         // body's category colour. Built in the inertial frame like the markers,
-        // then pre-rotated by the inverse of the full model so the shared
-        // thick-line shader's model transform cancels — keeping them pinned to
-        // each body regardless of GMST or the manual earth spin.
-        let unspin = glam::Mat3::from_mat4(model).transpose();
+        // then pre-rotated by -spin so the shared thick-line shader's model
+        // (GMST) spin cancels — keeping them pinned directly under each body.
+        let unspin = glam::Mat3::from_rotation_y(-spin);
         let mut ground: Vec<mesh::ThickLineInstance> = Vec::new();
         for i in 0..self.world.bodies.len() {
             // Hidden types suppress every artifact, ground anchors included.

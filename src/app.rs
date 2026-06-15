@@ -456,12 +456,12 @@ impl ApplicationHandler for App {
                         // Fixed/realtime mode only; fly mode is keyboard-driven.
                         if !r.is_fly_mode() {
                             const ROT: f32 = 0.005; // rad per pixel
-                            if mods.control_key() {
-                                r.zoom_camera(dy * 0.002); // Ctrl: scroll up = zoom in
-                            } else if mods.shift_key() {
-                                r.orbit_camera(-dx * ROT, dy * ROT); // Shift: orbit camera
+                            if mods.shift_key() {
+                                // Shift: orbit the view — the whole scene (Earth
+                                // + the satellites attached to it) turns together.
+                                r.orbit_camera(-dx * ROT, dy * ROT);
                             } else {
-                                r.spin_earth(dx * ROT, dy * ROT); // plain: spin the globe
+                                r.zoom_camera(dy * 0.002); // plain: scroll up = zoom in
                             }
                         }
                     }
