@@ -435,34 +435,41 @@ fn properties_panel(ctx: &Context, ui: &mut UiState, world: &World) {
                     c.label(RichText::new("BY TYPE").weak());
                     for (i, &cat) in CATEGORIES.iter().enumerate() {
                         let t = &mut s.types[i];
-                        let header = RichText::new(category_label(cat)).color(nord(cat.color()));
-                        egui::CollapsingHeader::new(header)
-                            .id_salt(("type", i))
-                            .default_open(false)
-                            .show(c, |g| {
-                                g.checkbox(&mut t.visible, "visible");
-                                // Max objects of this type to show (random subset).
-                                let resp = g.add(
-                                    egui::Slider::new(&mut t.max_shown, 0..=MAX_SAMPLE)
-                                        .text("max shown"),
-                                );
-                                if resp.drag_stopped() || (resp.changed() && !resp.dragged()) {
-                                    request_resample = true;
-                                }
-                                g.horizontal(|h| {
-                                    h.label("symbol");
-                                    egui::ComboBox::from_id_salt(("symbol", i))
-                                        .selected_text(t.symbol.label())
-                                        .width(104.0)
-                                        .show_ui(h, |cb| {
-                                            for opt in Symbol::ALL {
-                                                cb.selectable_value(&mut t.symbol, opt, opt.label());
-                                            }
-                                        });
-                                });
-                                g.add(egui::Slider::new(&mut t.size, 0.25..=4.0).text("size ×"));
-                                g.checkbox(&mut t.show_track, "orbit track");
+                        // Custom collapsing node so the visibility checkbox lives
+                        // on the header row (toggle a whole type without expanding).
+                        let id = c.make_persistent_id(("type", i));
+                        egui::collapsing_header::CollapsingState::load_with_default_open(
+                            c.ctx(),
+                            id,
+                            false,
+                        )
+                        .show_header(c, |h| {
+                            h.checkbox(&mut t.visible, "");
+                            h.label(RichText::new(category_label(cat)).color(nord(cat.color())));
+                        })
+                        .body(|b| {
+                            // Max objects of this type to show (random subset).
+                            let resp = b.add(
+                                egui::Slider::new(&mut t.max_shown, 0..=MAX_SAMPLE)
+                                    .text("max shown"),
+                            );
+                            if resp.drag_stopped() || (resp.changed() && !resp.dragged()) {
+                                request_resample = true;
+                            }
+                            b.horizontal(|h| {
+                                h.label("symbol");
+                                egui::ComboBox::from_id_salt(("symbol", i))
+                                    .selected_text(t.symbol.label())
+                                    .width(104.0)
+                                    .show_ui(h, |cb| {
+                                        for opt in Symbol::ALL {
+                                            cb.selectable_value(&mut t.symbol, opt, opt.label());
+                                        }
+                                    });
                             });
+                            b.add(egui::Slider::new(&mut t.size, 0.25..=4.0).text("size ×"));
+                            b.checkbox(&mut t.show_track, "orbit track");
+                        });
                     }
                 });
 
