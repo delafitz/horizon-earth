@@ -14,13 +14,21 @@ struct U {
     style1: vec4<f32>,
     // [egui] x = ground-line width (px), y = ground-line alpha.
     style2: vec4<f32>,
+    sun: vec4<f32>, // xyz = sun direction, w = night brightness floor
 };
 @group(0) @binding(0) var<uniform> u: U;
 
 struct VOut {
     @builtin(position) clip: vec4<f32>,
     @location(0) col: vec3<f32>,
+    @location(1) world: vec3<f32>,
 };
+
+// Day/night dimming factor for a surface point (night floor -> full at the
+// terminator), shared by the near-side fragment entries.
+fn shade(world: vec3<f32>) -> f32 {
+    return mix(u.sun.w, 1.0, smoothstep(-0.12, 0.12, dot(normalize(world), u.sun.xyz)));
+}
 
 @vertex
 fn vs_main(
@@ -61,12 +69,13 @@ fn vs_main(
     var o: VOut;
     o.clip = c;
     o.col = col_layer.xyz;
+    o.world = select(w0, w1, corner.x > 0.5);
     return o;
 }
 
 @fragment
 fn fs_main(in: VOut) -> @location(0) vec4<f32> {
-    return vec4<f32>(in.col * u.style0.w, 1.0);
+    return vec4<f32>(in.col * u.style0.w * shade(in.world), 1.0);
 }
 
 // Far-hemisphere variant: faint, alpha-blended (seen "through the glass").
@@ -79,7 +88,7 @@ fn fs_back(in: VOut) -> @location(0) vec4<f32> {
 // category colour. Near pass at full ground alpha, far pass dimmed.
 @fragment
 fn fs_ground(in: VOut) -> @location(0) vec4<f32> {
-    return vec4<f32>(in.col, u.style2.y);
+    return vec4<f32>(in.col * shade(in.world), u.style2.y);
 }
 
 @fragment

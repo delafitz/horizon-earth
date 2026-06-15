@@ -36,6 +36,9 @@ const CITIES_GEOJSON: &str =
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32FloatStencil8;
 // Stencil value marking near-side land (written by the fill, tested by cities).
 const STENCIL_LAND: u32 = 1;
+// Brightness of the night side (0 = black, 1 = no dimming) for the globe and
+// ground artifacts; the lit side is full brightness, blended across the terminator.
+const NIGHT_DIM: f32 = 0.18;
 
 // Nord palette (linear-ish RGB, written directly to a non-sRGB target).
 const COLOR_COAST: [f32; 3] = [0.533, 0.753, 0.816]; // Nord8 #88C0D0
@@ -111,6 +114,7 @@ struct Uniforms {
     // z = coastline width px, w = border width px
     style2: [f32; 4], // x = ground-line width px, y = ground-line alpha,
     // z = far-side alpha for satellite layers (tracks/markers/ground)
+    sun: [f32; 4], // xyz = sun direction (render frame), w = night brightness floor
 }
 
 /// A city kept for rendering: earth-fixed position (spins with the globe) plus
@@ -910,6 +914,11 @@ impl Renderer {
         let spin = self.world.earth_rotation().rem_euclid(std::f64::consts::TAU) as f32;
         let model = Mat4::from_rotation_y(spin);
 
+        // Sun direction in the render frame (ECI Z-up -> render Y-up, no scale),
+        // for day/night dimming of the globe and ground artifacts.
+        let sun_eci = horizon_core::sun::sun_direction_eci(self.world.current());
+        let sun = Vec3::new(sun_eci.x as f32, sun_eci.z as f32, -sun_eci.y as f32).normalize();
+
         let s = &self.settings;
         let u = Uniforms {
             view_proj: view_proj.to_cols_array_2d(),
@@ -925,6 +934,7 @@ impl Renderer {
                 s.border_width_px(),
             ],
             style2: [s.ground_width_px(), s.ground_alpha, s.sat_back_alpha, s.cities_alpha],
+            sun: [sun.x, sun.y, sun.z, NIGHT_DIM],
         };
         self.queue
             .write_buffer(&self.uniform_buf, 0, bytemuck::cast_slice(&[u]));

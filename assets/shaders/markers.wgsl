@@ -10,6 +10,7 @@ struct U {
     style0: vec4<f32>,
     style1: vec4<f32>,
     style2: vec4<f32>, // z = far-side satellite-artifact alpha
+    sun: vec4<f32>,    // xyz = sun direction, w = night brightness floor
 };
 @group(0) @binding(0) var<uniform> u: U;
 
@@ -18,6 +19,7 @@ struct VOut {
     @location(0) uv: vec2<f32>,
     @location(1) color: vec3<f32>,
     @location(2) kind: f32,
+    @location(3) world: vec3<f32>,
 };
 
 @vertex
@@ -39,6 +41,7 @@ fn vs_main(
     o.uv = corner;
     o.color = color_kind.xyz;
     o.kind = color_kind.w;
+    o.world = center;
     return o;
 }
 
@@ -68,6 +71,7 @@ fn vs_surface(
     o.uv = corner;
     o.color = color_kind.xyz;
     o.kind = color_kind.w;
+    o.world = world;
     return o;
 }
 
@@ -125,12 +129,14 @@ fn fs_back(in: VOut) -> @location(0) vec4<f32> {
     return vec4<f32>(in.color * 0.7, a);
 }
 
-// City markers: same shapes, scaled by the city opacity (style2.w).
+// City markers: same shapes, scaled by the city opacity (style2.w) and dimmed
+// on the night side of the terminator.
 @fragment
 fn fs_city(in: VOut) -> @location(0) vec4<f32> {
     let a = marker_alpha(in.uv, in.kind) * u.style2.w;
     if (a < 0.02) {
         discard;
     }
-    return vec4<f32>(in.color, a);
+    let lit = mix(u.sun.w, 1.0, smoothstep(-0.12, 0.12, dot(normalize(in.world), u.sun.xyz)));
+    return vec4<f32>(in.color * lit, a);
 }

@@ -9,6 +9,9 @@ struct U {
     // [egui] x = far-side line alpha, y = land fill alpha, z = track alpha,
     // w = line brightness.
     style0: vec4<f32>,
+    style1: vec4<f32>,
+    style2: vec4<f32>,
+    sun: vec4<f32>, // xyz = sun direction, w = night brightness floor
 };
 @group(0) @binding(0) var<uniform> u: U;
 
@@ -69,5 +72,7 @@ fn fs_fill(in: FillOut) -> @location(0) vec4<f32> {
     if (dot(n, v) <= 0.0) {
         discard;
     }
-    return vec4<f32>(in.col, u.style0.y);
+    // Dim the land fill on the night side of the terminator.
+    let lit = mix(u.sun.w, 1.0, smoothstep(-0.12, 0.12, dot(n, u.sun.xyz)));
+    return vec4<f32>(in.col * lit, u.style0.y);
 }

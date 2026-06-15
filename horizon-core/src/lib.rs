@@ -19,6 +19,7 @@ pub mod camera;
 pub mod category;
 pub mod frames;
 pub mod orbit;
+pub mod sun;
 pub mod time;
 pub mod units;
 pub mod world;
