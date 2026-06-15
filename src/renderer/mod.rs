@@ -33,7 +33,9 @@ const COUNTRIES_GEOJSON: &str =
 const CITIES_GEOJSON: &str =
     include_str!("../../assets/earth/ne_10m_populated_places.geojson");
 
-const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
+const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32FloatStencil8;
+// Stencil value marking near-side land (written by the fill, tested by cities).
+const STENCIL_LAND: u32 = 1;
 
 // Nord palette (linear-ish RGB, written directly to a non-sRGB target).
 const COLOR_COAST: [f32; 3] = [0.533, 0.753, 0.816]; // Nord8 #88C0D0
@@ -214,7 +216,10 @@ impl Renderer {
             .request_device(
                 &wgpu::DeviceDescriptor {
                     label: Some("horizon-device"),
-                    required_features: wgpu::Features::empty(),
+                    // Depth+stencil with a 32-bit float depth: keeps the fly-mode
+                    // depth precision while giving a stencil plane for the
+                    // land-mask clip of city dots.
+                    required_features: wgpu::Features::DEPTH32FLOAT_STENCIL8,
                     required_limits: wgpu::Limits::default(),
                     memory_hints: wgpu::MemoryHints::default(),
                 },
@@ -383,7 +388,9 @@ impl Renderer {
                 format: DEPTH_FORMAT,
                 depth_write_enabled: false,
                 depth_compare: wgpu::CompareFunction::Always,
-                stencil: wgpu::StencilState::default(),
+                // Stamp near-side land into the stencil plane (far hemisphere is
+                // discarded in fs_fill) so city dots can clip to the coastline.
+                stencil: stencil_write(),
                 bias: wgpu::DepthBiasState::default(),
             }),
             multisample: wgpu::MultisampleState::default(),
@@ -482,7 +489,8 @@ impl Renderer {
                 format: DEPTH_FORMAT,
                 depth_write_enabled: false,
                 depth_compare: wgpu::CompareFunction::LessEqual,
-                stencil: wgpu::StencilState::default(),
+                // Only draw where the land stencil is set, clipping dots to land.
+                stencil: stencil_test(),
                 bias: wgpu::DepthBiasState::default(),
             }),
             multisample: wgpu::MultisampleState::default(),
@@ -932,7 +940,6 @@ impl Renderer {
                         p.z,
                         MARKER_SIZE
                             * b.category.size_scale()
-                            * self.settings.marker_size
                             * self.settings.marker_scale(b.category),
                     ],
                     color: b.color,
@@ -981,8 +988,8 @@ impl Renderer {
         let unspin = glam::Mat3::from_rotation_y(-spin);
         let mut ground: Vec<mesh::ThickLineInstance> = Vec::new();
         for i in 0..self.world.bodies.len() {
-            // Hidden types suppress every artifact, ground anchors included.
-            if !self.settings.type_visible(self.world.bodies[i].category) {
+            // Per-type ground toggle (gated by the type's master visibility).
+            if !self.settings.ground_visible(self.world.bodies[i].category) {
                 continue;
             }
             let p = eci_to_world(self.world.body_position_eci(i)).as_vec3();
@@ -1040,9 +1047,8 @@ impl Renderer {
         if self.is_fly_mode() {
             emit_fly_banner(&mut verts, width, height);
         }
-        if self.settings.show_labels {
-            verts.extend(self.build_labels(view_proj, eye, width, height));
-        }
+        // Per-type label visibility is filtered inside build_labels.
+        verts.extend(self.build_labels(view_proj, eye, width, height));
         if self.settings.cities_show && self.settings.cities_labels {
             self.build_city_labels(view_proj, eye, spin, width, height, &mut verts);
         }
@@ -1210,13 +1216,18 @@ impl Renderer {
                         load: wgpu::LoadOp::Clear(1.0),
                         store: wgpu::StoreOp::Store,
                     }),
-                    stencil_ops: None,
+                    stencil_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(0), // 0 = ocean; land fill writes 1
+                        store: wgpu::StoreOp::Store,
+                    }),
                 }),
                 timestamp_writes: None,
                 occlusion_query_set: None,
             });
 
             rp.set_bind_group(0, &self.bind_group, &[]);
+            // Land mask reference: the fill writes this value, cities test for it.
+            rp.set_stencil_reference(STENCIL_LAND);
 
             // Background stars.
             rp.set_pipeline(&self.starfield_pipeline);
@@ -1240,7 +1251,7 @@ impl Renderer {
             }
 
             // Orbit tracks.
-            if self.track_vcount > 0 && self.settings.show_tracks {
+            if self.track_vcount > 0 {
                 rp.set_pipeline(&self.track_back_pipeline);
                 rp.set_vertex_buffer(0, self.track_vbuf.slice(..));
                 rp.draw(0..self.track_vcount, 0..1);
@@ -1287,7 +1298,7 @@ impl Renderer {
             }
 
             // Orbit tracks.
-            if self.track_vcount > 0 && self.settings.show_tracks {
+            if self.track_vcount > 0 {
                 rp.set_pipeline(&self.track_pipeline);
                 rp.set_vertex_buffer(0, self.track_vbuf.slice(..));
                 rp.draw(0..self.track_vcount, 0..1);
@@ -1471,6 +1482,30 @@ fn emit_text(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Stencil state that stamps the reference value (set via `set_stencil_reference`)
+/// wherever a fragment passes — used to mark the land area for the city clip.
+fn stencil_write() -> wgpu::StencilState {
+    let face = wgpu::StencilFaceState {
+        compare: wgpu::CompareFunction::Always,
+        fail_op: wgpu::StencilOperation::Keep,
+        depth_fail_op: wgpu::StencilOperation::Keep,
+        pass_op: wgpu::StencilOperation::Replace,
+    };
+    wgpu::StencilState { front: face, back: face, read_mask: 0xff, write_mask: 0xff }
+}
+
+/// Stencil state that only passes where the stencil already equals the reference
+/// (never writes) — used so city dots draw only over marked land.
+fn stencil_test() -> wgpu::StencilState {
+    let face = wgpu::StencilFaceState {
+        compare: wgpu::CompareFunction::Equal,
+        fail_op: wgpu::StencilOperation::Keep,
+        depth_fail_op: wgpu::StencilOperation::Keep,
+        pass_op: wgpu::StencilOperation::Keep,
+    };
+    wgpu::StencilState { front: face, back: face, read_mask: 0xff, write_mask: 0x00 }
+}
+
 fn make_pipeline(
     device: &wgpu::Device,
     layout: &wgpu::PipelineLayout,

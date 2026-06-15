@@ -18,22 +18,19 @@ use horizon_core::{Epoch, World};
 #[derive(Clone, Copy)]
 pub struct RenderSettings {
     // --- Satellites ---
-    /// Multiplier on each body marker's base on-screen size.
-    pub marker_size: f32,
-    pub show_labels: bool,
-    pub show_tracks: bool,
+    // Size, labels, orbit-track and ground toggles are per-type (see TypeStyle);
+    // these are shared appearance params driven by single uniforms.
     /// Near-side orbit-track opacity.
     pub track_alpha: f32,
     /// Far-side opacity multiplier for satellite layers (markers/tracks/ground),
     /// seen "through the glass".
     pub sat_back_alpha: f32,
-    pub ground_visible: bool,
     /// Ground-anchor (nadir line + footprint ring) stroke width in pixels.
     pub ground_width: f32,
     /// Ground-anchor opacity.
     pub ground_alpha: f32,
-    /// Per-type attributes (visibility, symbol, size, track), indexed parallel
-    /// to [`CATEGORIES`].
+    /// Per-type attributes (visibility, symbol, size, labels, track, ground),
+    /// indexed parallel to [`CATEGORIES`].
     pub types: [TypeStyle; CATEGORIES.len()],
 
     // --- Land (coastlines / borders / fill) ---
@@ -70,12 +67,8 @@ pub struct RenderSettings {
 impl Default for RenderSettings {
     fn default() -> Self {
         Self {
-            marker_size: 1.0,
-            show_labels: true,
-            show_tracks: true,
             track_alpha: 0.35,
             sat_back_alpha: 0.4,
-            ground_visible: true,
             ground_width: 1.5,
             ground_alpha: 0.5,
             types: [TypeStyle::default(); CATEGORIES.len()],
@@ -123,16 +116,18 @@ impl RenderSettings {
         }
     }
 
-    /// Whether category `cat` is shown at all. The per-type `visible` checkbox
-    /// is a master switch: when off, every artifact for that type — markers,
-    /// HUD labels, orbit tracks and ground anchors — is suppressed.
-    pub fn type_visible(&self, cat: Category) -> bool {
-        self.ty(cat).visible
+    /// Whether HUD labels for category `cat` should be drawn (per-type `labels`,
+    /// gated by the type's master `visible`).
+    pub fn label_visible(&self, cat: Category) -> bool {
+        let t = self.ty(cat);
+        t.visible && t.show_labels
     }
 
-    /// Whether HUD labels for category `cat` should be drawn.
-    pub fn label_visible(&self, cat: Category) -> bool {
-        self.ty(cat).visible
+    /// Whether ground anchors for category `cat` should be drawn (per-type
+    /// `ground`, gated by the type's master `visible`).
+    pub fn ground_visible(&self, cat: Category) -> bool {
+        let t = self.ty(cat);
+        t.visible && t.show_ground
     }
 
     /// Whether orbit tracks for category `cat` should be drawn (hidden types
@@ -171,13 +166,10 @@ impl RenderSettings {
         }
     }
 
-    /// Ground-anchor width in px, `0.0` when hidden.
+    /// Ground-anchor stroke width in px (shared appearance; per-type on/off is
+    /// handled in the renderer's ground build loop).
     pub fn ground_width_px(&self) -> f32 {
-        if self.ground_visible {
-            self.ground_width
-        } else {
-            0.0
-        }
+        self.ground_width
     }
 }
 
@@ -188,7 +180,11 @@ pub struct TypeStyle {
     pub symbol: Symbol,
     /// On-screen marker size multiplier for this type.
     pub size: f32,
+    /// Whether HUD labels are drawn for this type.
+    pub show_labels: bool,
     pub show_track: bool,
+    /// Whether ground anchors (nadir line + footprint ring) are drawn.
+    pub show_ground: bool,
     /// Max objects of this type to show (random subset). Capped at [`MAX_SAMPLE`].
     pub max_shown: usize,
 }
@@ -199,7 +195,9 @@ impl Default for TypeStyle {
             visible: true,
             symbol: Symbol::Auto,
             size: 1.0,
+            show_labels: true,
             show_track: true,
+            show_ground: true,
             max_shown: DEFAULT_SHOWN,
         }
     }
@@ -417,13 +415,9 @@ fn properties_panel(ctx: &Context, ui: &mut UiState, world: &World) {
             egui::CollapsingHeader::new("Satellites")
                 .default_open(true)
                 .show(p, |c| {
-                    c.add(egui::Slider::new(&mut s.marker_size, 0.25..=4.0).text("marker size"));
-                    c.checkbox(&mut s.show_labels, "labels");
-                    c.checkbox(&mut s.show_tracks, "orbit tracks");
-                    c.add_enabled(
-                        s.show_tracks,
-                        egui::Slider::new(&mut s.track_alpha, 0.0..=1.0).text("track opacity"),
-                    );
+                    // Shared appearance (single uniforms); per-type size/labels/
+                    // tracks/ground toggles live in the type nodes below.
+                    c.add(egui::Slider::new(&mut s.track_alpha, 0.0..=1.0).text("track opacity"));
                     c.add(
                         egui::Slider::new(&mut s.sat_back_alpha, 0.0..=1.0)
                             .text("far-side opacity"),
@@ -433,15 +427,8 @@ fn properties_panel(ctx: &Context, ui: &mut UiState, world: &World) {
                         .id_salt("ground")
                         .default_open(false)
                         .show(c, |g| {
-                            g.checkbox(&mut s.ground_visible, "visible");
-                            g.add_enabled(
-                                s.ground_visible,
-                                egui::Slider::new(&mut s.ground_width, 0.5..=6.0).text("width px"),
-                            );
-                            g.add_enabled(
-                                s.ground_visible,
-                                egui::Slider::new(&mut s.ground_alpha, 0.0..=1.0).text("opacity"),
-                            );
+                            g.add(egui::Slider::new(&mut s.ground_width, 0.5..=6.0).text("width px"));
+                            g.add(egui::Slider::new(&mut s.ground_alpha, 0.0..=1.0).text("opacity"));
                         });
 
                     c.add_space(4.0);
@@ -481,7 +468,9 @@ fn properties_panel(ctx: &Context, ui: &mut UiState, world: &World) {
                                     });
                             });
                             b.add(egui::Slider::new(&mut t.size, 0.25..=4.0).text("size ×"));
+                            b.checkbox(&mut t.show_labels, "labels");
                             b.checkbox(&mut t.show_track, "orbit track");
+                            b.checkbox(&mut t.show_ground, "ground anchors");
                         });
                     }
                 });
