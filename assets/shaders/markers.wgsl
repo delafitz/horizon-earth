@@ -129,15 +129,16 @@ fn fs_back(in: VOut) -> @location(0) vec4<f32> {
     return vec4<f32>(in.color * 0.7, a);
 }
 
-// City markers: city lights — full bright on the night side of the terminator,
-// faded in daylight (the inverse of how the rest of the ground dims).
+// City markers: city lights. Colour is kept as-is; intensity is carried by
+// opacity — full on the night side of the terminator, more transparent in
+// daylight — so cities glow at night without tinting.
 @fragment
 fn fs_city(in: VOut) -> @location(0) vec4<f32> {
-    let a = marker_alpha(in.uv, in.kind) * u.style2.w;
+    let day = smoothstep(-0.12, 0.12, dot(normalize(in.world), u.sun.xyz));
+    let night_fade = mix(1.0, 0.35, day); // night = full, day = faded
+    let a = marker_alpha(in.uv, in.kind) * u.style2.w * night_fade;
     if (a < 0.02) {
         discard;
     }
-    let day = smoothstep(-0.12, 0.12, dot(normalize(in.world), u.sun.xyz));
-    let lit = mix(1.0, 0.4, day); // night = full glow, day = faded
-    return vec4<f32>(in.color * lit, a);
+    return vec4<f32>(in.color, a);
 }

@@ -50,8 +50,7 @@ const COLOR_CITY: [f32; 3] = [0.533, 0.753, 0.816]; // Nord8 frost blue — city
 const CITY_RADIUS: f32 = 1.004; // just above the surface / land fill
 const CITY_SIZE_MIN: f32 = 0.003; // on-screen half-size (NDC) for small towns
 const CITY_SIZE_MAX: f32 = 0.012; // ... up to the largest megacities
-const CITY_INTENSITY_MIN: f32 = 0.4; // colour scale for the dimmest cities
-// Population (log10) mapped to the [0,1] size/intensity ramp: ~100k -> 0, ~20M -> 1.
+// Population (log10) mapped to the [0,1] size ramp: ~100k -> 0, ~20M -> 1.
 const CITY_LOG_MIN: f32 = 5.0;
 const CITY_LOG_MAX: f32 = 7.3;
 // Land-fill curvature tolerance: the max angle (degrees) a fill triangle edge
@@ -672,8 +671,14 @@ impl Renderer {
 
         // Static orbit paths (the body slides along them each frame). Sampled in
         // ECI/km over one period, then mapped into the render frame.
+        // Filtered to the initially-visible types so it matches the starting
+        // `track_mask` (else every type's tracks show until the mask changes).
+        let initial_settings = RenderSettings::default();
         let mut track_verts: Vec<VertexPC> = Vec::new();
         for body in &world.bodies {
+            if !initial_settings.track_visible(body.category) {
+                continue;
+            }
             let col = [body.color[0] * 0.85, body.color[1] * 0.85, body.color[2] * 0.85];
             let pts = sample_track(body.motion.as_ref(), 128);
             for w in pts.windows(2) {
@@ -971,15 +976,16 @@ impl Renderer {
                 .filter(|c| c.pop >= self.settings.cities_min_pop)
                 .map(|c| {
                     let p = city_rot * c.pos;
-                    // Population (log) -> [0,1] ramp driving size and brightness.
+                    // Population (log) -> [0,1] ramp driving the dot size. Colour
+                    // stays the full city colour (intensity is day/night, in the
+                    // shader) so dots don't tint dark with population.
                     let t = ((c.pop.max(1.0).log10() - CITY_LOG_MIN)
                         / (CITY_LOG_MAX - CITY_LOG_MIN))
                         .clamp(0.0, 1.0);
                     let size = CITY_SIZE_MIN + t * (CITY_SIZE_MAX - CITY_SIZE_MIN);
-                    let glow = CITY_INTENSITY_MIN + t * (1.0 - CITY_INTENSITY_MIN);
                     MarkerInstance {
                         center_size: [p.x, p.y, p.z, size],
-                        color: [COLOR_CITY[0] * glow, COLOR_CITY[1] * glow, COLOR_CITY[2] * glow],
+                        color: COLOR_CITY,
                         kind: 3.0,
                     }
                 })
