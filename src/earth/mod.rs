@@ -46,6 +46,48 @@ pub fn build_thick_lines(
     }
 }
 
+/// Triangulate the closed rings in lon/lat and emit clip-space 2D vertices
+/// (x = lon/180, y = lat/90) for baking the equirectangular land mask. No
+/// subdivision is needed (it's a flat 2D raster), so the triangulation tiles
+/// the polygons exactly — the mask is crack-free regardless of concavity.
+pub fn build_land_mask_2d(rings: &[PolyLine], out: &mut Vec<[f32; 2]>) {
+    for ring in rings {
+        // Unwrap longitude so antimeridian-crossing rings (Antarctica's polar
+        // cap, Chukotka, Fiji…) are continuous before triangulating.
+        let unwrapped = unwrap_lon(ring);
+        for tri in triangulate(&unwrapped).chunks_exact(3) {
+            // Emit each triangle at -360/0/+360 so the wrapped parts land in the
+            // [-180,180] bake window; off-window copies are simply clipped.
+            for off in [-360.0_f64, 0.0, 360.0] {
+                for v in tri {
+                    out.push([((v[0] + off) / 180.0) as f32, (v[1] / 90.0) as f32]);
+                }
+            }
+        }
+    }
+}
+
+/// Make a ring's longitudes continuous by removing ±360° jumps, so a ring that
+/// crosses the antimeridian (or encircles a pole) triangulates as one piece.
+fn unwrap_lon(ring: &[[f64; 2]]) -> Vec<[f64; 2]> {
+    let mut out = Vec::with_capacity(ring.len());
+    if let Some(&first) = ring.first() {
+        let mut acc = first[0];
+        out.push(first);
+        for w in ring.windows(2) {
+            let mut d = w[1][0] - w[0][0];
+            if d > 180.0 {
+                d -= 360.0;
+            } else if d < -180.0 {
+                d += 360.0;
+            }
+            acc += d;
+            out.push([acc, w[1][1]]);
+        }
+    }
+    out
+}
+
 /// Triangulate each closed ring and append the triangles to `out` (TriangleList
 /// topology: three vertices per triangle), conforming to the sphere. Used to
 /// give land a faint translucent body.

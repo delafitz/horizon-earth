@@ -134,6 +134,7 @@ pub struct Renderer {
 
     uniform_buf: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
+    mask_bind_group: wgpu::BindGroup,
 
     starfield_pipeline: wgpu::RenderPipeline,
     globe_pipeline: wgpu::RenderPipeline,
@@ -299,6 +300,7 @@ impl Renderer {
         // --- Shaders ---------------------------------------------------------
         let starfield_sh = shader(&device, "starfield", include_str!("../../assets/shaders/starfield.wgsl"));
         let globe_sh = shader(&device, "globe", include_str!("../../assets/shaders/globe.wgsl"));
+        let mask_sh = shader(&device, "mask", include_str!("../../assets/shaders/mask.wgsl"));
         let lines_sh = shader(&device, "lines", include_str!("../../assets/shaders/lines.wgsl"));
         let thick_lines_sh = shader(
             &device,
@@ -308,6 +310,131 @@ impl Renderer {
         let atmo_sh = shader(&device, "atmosphere", include_str!("../../assets/shaders/atmosphere.wgsl"));
         let track_sh = shader(&device, "track", include_str!("../../assets/shaders/track.wgsl"));
         let markers_sh = shader(&device, "markers", include_str!("../../assets/shaders/markers.wgsl"));
+
+        // --- Land mask -------------------------------------------------------
+        // Country polygons rasterised once into an equirectangular R8 texture,
+        // sampled on the globe so the land fill conforms to the sphere with no
+        // triangulation seams (the on-mesh fill is reduced to a stencil writer).
+        let mask_rings = crate::data::extract_polygon_rings(COUNTRIES_GEOJSON);
+        let mut mask_verts: Vec<[f32; 2]> = Vec::new();
+        crate::earth::build_land_mask_2d(&mask_rings, &mut mask_verts);
+        let mask_vbuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("land-mask-verts"),
+            contents: bytemuck::cast_slice(&mask_verts),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+        let mask_tex = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("land-mask"),
+            size: wgpu::Extent3d { width: 4096, height: 2048, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::R8Unorm,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let mask_view = mask_tex.create_view(&wgpu::TextureViewDescriptor::default());
+        let mask_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("land-mask-sampler"),
+            address_mode_u: wgpu::AddressMode::Repeat, // longitude wraps
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+        let mask_vlayout = wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<[f32; 2]>() as u64,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &ATTRS_CORNER, // a single Float32x2 at location 0
+        };
+        let bake_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("mask-bake-layout"),
+            bind_group_layouts: &[],
+            push_constant_ranges: &[],
+        });
+        let bake_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("land-mask-bake"),
+            layout: Some(&bake_layout),
+            vertex: wgpu::VertexState {
+                module: &mask_sh,
+                entry_point: "vs_main",
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                buffers: &[mask_vlayout],
+            },
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &mask_sh,
+                entry_point: "fs_main",
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                targets: &[Some(wgpu::TextureFormat::R8Unorm.into())],
+            }),
+            multiview: None,
+            cache: None,
+        });
+        {
+            let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("bake-land-mask"),
+            });
+            {
+                let mut rp = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("bake-land-mask"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &mask_view,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), // 0 = ocean
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                });
+                rp.set_pipeline(&bake_pipeline);
+                rp.set_vertex_buffer(0, mask_vbuf.slice(..));
+                rp.draw(0..mask_verts.len() as u32, 0..1);
+            }
+            queue.submit(std::iter::once(enc.finish()));
+        }
+        log::info!("baked land mask from {} triangles", mask_verts.len() / 3);
+
+        let mask_bind_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("land-mask-layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+        let mask_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("land-mask-bind-group"),
+            layout: &mask_bind_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&mask_view) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&mask_sampler) },
+            ],
+        });
+        // The globe samples the mask, so it needs both bind groups.
+        let globe_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("globe-pipeline-layout"),
+            bind_group_layouts: &[&bind_layout, &mask_bind_layout],
+            push_constant_ranges: &[],
+        });
 
         let pn_layout = wgpu::VertexBufferLayout {
             array_stride: std::mem::size_of::<VertexPN>() as u64,
@@ -366,7 +493,7 @@ impl Renderer {
             wgpu::CompareFunction::LessEqual, "fs_main",
         );
         let globe_pipeline = make_pipeline(
-            &device, &pipeline_layout, &globe_sh, format, &[pn_layout],
+            &device, &globe_pipeline_layout, &globe_sh, format, &[pn_layout],
             wgpu::PrimitiveTopology::TriangleList,
             Some(wgpu::BlendState::ALPHA_BLENDING), true,
             wgpu::CompareFunction::Less, "fs_main",
@@ -403,10 +530,13 @@ impl Renderer {
                 module: &lines_sh,
                 entry_point: "fs_fill",
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
+                // Stencil-only now: the land colour comes from the mask sampled
+                // on the globe; this pass just stamps the land stencil for the
+                // city clip, so disable colour writes.
                 targets: &[Some(wgpu::ColorTargetState {
                     format,
                     blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                    write_mask: wgpu::ColorWrites::ALL,
+                    write_mask: wgpu::ColorWrites::empty(),
                 })],
             }),
             multiview: None,
@@ -748,6 +878,7 @@ impl Renderer {
             depth_view,
             uniform_buf,
             bind_group,
+            mask_bind_group,
             starfield_pipeline,
             globe_pipeline,
             fill_pipeline,
@@ -1256,6 +1387,8 @@ impl Renderer {
             });
 
             rp.set_bind_group(0, &self.bind_group, &[]);
+            // Land mask (group 1) is sampled by the globe to draw the land fill.
+            rp.set_bind_group(1, &self.mask_bind_group, &[]);
             // Land mask reference: the fill writes this value, cities test for it.
             rp.set_stencil_reference(STENCIL_LAND);
 
