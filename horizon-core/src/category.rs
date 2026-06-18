@@ -70,24 +70,27 @@ impl Category {
         }
     }
 
-    /// HUD marker symbol passed to the marker shader:
-    /// `0.0` = outline box, `1.0` = filled square, `2.0` = wire triangle.
-    /// Crewed stations get the distinctive wire triangle.
+    /// HUD marker symbol passed to the marker shader: `0.0` = outline box,
+    /// `1.0` = filled square, `2.0` = wire triangle, `4.0` = outline diamond.
+    /// Crewed stations get the wire triangle; AST sats the diamond.
     pub fn marker_kind(self) -> f32 {
         match self {
             Category::Station => 2.0,
-            Category::Geo | Category::Ast => 1.0,
+            Category::Ast => 4.0, // outline diamond
+            Category::Geo => 1.0,
             _ => 0.0,
         }
     }
 
-    /// On-screen size multiplier — crewed stations and the large AST satellites
-    /// are rendered bold.
+    /// On-screen size multiplier — crewed stations are rendered bold. The AST
+    /// diamond is the box outline rotated 45°, whose bounding box is √2 larger,
+    /// so its billboard is scaled by √2 to keep the square the same size (and not
+    /// clip the points against the marker quad).
     pub fn size_scale(self) -> f32 {
-        if matches!(self, Category::Station | Category::Ast) {
-            1.7
-        } else {
-            1.0
+        match self {
+            Category::Station => 1.7,
+            Category::Ast => std::f32::consts::SQRT_2,
+            _ => 1.0,
         }
     }
 }

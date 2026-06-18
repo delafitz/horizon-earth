@@ -1129,9 +1129,18 @@ impl Renderer {
     /// marker instances themselves are refilled by the next `update`.
     pub fn set_world(&mut self, world: World) {
         self.world = world;
+        let n = self.world.bodies.len().max(1);
         self.marker_inst_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("marker-instances"),
-            size: (self.world.bodies.len().max(1) * std::mem::size_of::<MarkerInstance>()) as u64,
+            size: (n * std::mem::size_of::<MarkerInstance>()) as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        // Ground anchors are also per-body, refilled each frame — resize too, or
+        // a larger body count overruns it in `update`.
+        self.ground_inst_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("ground-instances"),
+            size: (n * (1 + RING_SEGMENTS) * std::mem::size_of::<mesh::ThickLineInstance>()) as u64,
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });

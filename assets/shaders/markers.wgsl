@@ -93,8 +93,18 @@ fn triangle_alpha(uv: vec2<f32>) -> f32 {
 }
 
 // Marker coverage at corner `uv` for the given kind: 0 = outline box, 1 = filled
-// square (solid with a soft edge), 2 = wire triangle, 3 = filled circle (cities).
+// square (solid with a soft edge), 2 = wire triangle, 3 = filled circle (cities),
+// 4 = outline diamond (the box outline rotated 45deg).
 fn marker_alpha(uv: vec2<f32>, kind: f32) -> f32 {
+    if (kind > 3.5) {
+        // Diamond: the box outline in the L1 norm. With the billboard scaled by
+        // √2 (see Category::size_scale) the diagonal cancels, so the same band as
+        // the box gives an equal-size square, rotated, with equal stroke width.
+        let d = abs(uv.x) + abs(uv.y);
+        let outer = 1.0 - smoothstep(0.92, 1.0, d);
+        let inner = smoothstep(0.58, 0.72, d);
+        return outer * inner;
+    }
     if (kind > 2.5) {
         return 1.0 - smoothstep(0.78, 1.0, length(uv)); // filled circle
     }
