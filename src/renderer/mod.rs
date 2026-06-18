@@ -128,7 +128,7 @@ const LAYER_GROUND: f32 = 2.0;
 // along the local meridian and parallel (graticule-aligned). Two segments per
 // body; `CROSS_HALF` is each arm's half-length in render units (Earth R = 1).
 const CROSS_SEGMENTS: usize = 2;
-const CROSS_HALF: f32 = 0.02;
+const CROSS_HALF: f32 = 0.01;
 
 // On-screen half-size of a body marker, in NDC units.
 const MARKER_SIZE: f32 = 0.01;
