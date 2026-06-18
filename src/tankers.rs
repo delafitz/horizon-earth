@@ -16,8 +16,8 @@ use crate::renderer::mesh::VertexPC;
 /// Render radius for tanker geometry: just above the globe and land fill.
 const R: f32 = 1.0016;
 /// Marker dimensions in render units (Earth radius = 1).
-const LEN: f32 = 0.012; // triangle length along heading
-const HALF: f32 = 0.005; // half-width / rect half-size
+const LEN: f32 = 0.0085; // triangle length along heading
+const HALF: f32 = 0.0036; // half-width / rect half-size
 /// Below this speed (knots) a ship's course is meaningless → draw a rect.
 const MOVING_SOG_MIN: f64 = 0.5;
 /// Wake (stern tail) length in render units, scaled by speed-over-ground.
@@ -25,10 +25,10 @@ const WAKE_PER_KNOT: f32 = 0.0009;
 const WAKE_MIN: f32 = 0.006;
 const WAKE_MAX: f32 = 0.022;
 
-// Amber, distinct from the frost-blue cities/coastlines.
-const COLOR_TANKER: [f32; 3] = [0.92, 0.62, 0.34];
-const COLOR_STILL: [f32; 3] = [0.78, 0.55, 0.38];
-const COLOR_TRACK: [f32; 3] = [0.55, 0.38, 0.20];
+// Soft amber, distinct from the frost-blue cities/coastlines but not harsh.
+const COLOR_TANKER: [f32; 3] = [0.82, 0.62, 0.44];
+const COLOR_STILL: [f32; 3] = [0.70, 0.56, 0.45];
+const COLOR_TRACK: [f32; 3] = [0.50, 0.38, 0.25];
 
 /// One tanker, as written by the `horizon-ais` collector.
 #[derive(Deserialize)]
