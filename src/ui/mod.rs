@@ -71,7 +71,7 @@ impl Default for RenderSettings {
     fn default() -> Self {
         Self {
             track_alpha: 0.35,
-            sat_back_alpha: 0.4,
+            sat_back_alpha: 0.15,
             ground_width: 1.5,
             ground_alpha: 0.5,
             types: default_types(),
@@ -309,6 +309,8 @@ impl UiState {
 pub struct FrameInfo {
     pub fps: f32,
     pub gmst_deg: f64,
+    /// Camera distance from Earth-center, in Earth radii (the zoom level).
+    pub zoom: f64,
 }
 
 /// Install the lightweight, translucent "Nord wireframe" theme: panels tinted
@@ -634,6 +636,9 @@ fn display_panel(ctx: &Context, ui: &mut UiState, world: &World, info: &FrameInf
                 g.end_row();
                 g.label("objects");
                 g.label(format!("{}", world.bodies.len()));
+                g.end_row();
+                g.label("zoom");
+                g.label(format!("{:.1} R⊕", info.zoom));
                 g.end_row();
                 g.label("fps");
                 g.label(format!("{:.0}", info.fps));

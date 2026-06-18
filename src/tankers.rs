@@ -14,7 +14,9 @@ use crate::earth::latlon_to_xyz;
 use crate::renderer::mesh::VertexPC;
 
 /// Render radius for tanker geometry: just above the globe and land fill.
-const R: f32 = 1.0016;
+// Sit just above the surface / baked land fill (which cities clear at 1.004),
+// else the surface depth-occludes the markers.
+const R: f32 = 1.0042;
 /// Marker dimensions in render units (Earth radius = 1).
 const LEN: f32 = 0.0072; // triangle length along heading
 const HALF: f32 = 0.0030; // half-width / rect half-size

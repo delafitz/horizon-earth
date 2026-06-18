@@ -346,6 +346,7 @@ impl App {
                 let info = ui::FrameInfo {
                     fps: self.fps,
                     gmst_deg: renderer.world().earth_rotation().to_degrees(),
+                    zoom: renderer.camera_distance(),
                 };
                 let ui_state = &mut self.ui;
                 let world = renderer.world();
