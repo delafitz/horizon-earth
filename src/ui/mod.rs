@@ -212,6 +212,15 @@ pub const DEFAULT_SHOWN: usize = 100;
 /// Upper bound of the per-type "max shown" slider.
 pub const MAX_SAMPLE: usize = 300;
 
+/// Per-type upper bound for the "max shown" slider — Starlink can show its whole
+/// constellation; the rest stay modest.
+pub fn max_shown_cap(cat: Category) -> usize {
+    match cat {
+        Category::Starlink => 10_000,
+        _ => MAX_SAMPLE,
+    }
+}
+
 /// Default per-type styles: crewed stations and the (rare, notable) AST sats
 /// start visible; the rest are toggled on from the panel as wanted (keeps the
 /// out-of-box view uncluttered).
@@ -465,7 +474,8 @@ fn properties_panel(ctx: &Context, ui: &mut UiState, world: &World) {
                         .body(|b| {
                             // Max objects of this type to show (random subset).
                             let resp = b.add(
-                                egui::Slider::new(&mut t.max_shown, 0..=MAX_SAMPLE)
+                                egui::Slider::new(&mut t.max_shown, 0..=max_shown_cap(cat))
+                                    .logarithmic(true)
                                     .text("max shown"),
                             );
                             if resp.drag_stopped() || (resp.changed() && !resp.dragged()) {

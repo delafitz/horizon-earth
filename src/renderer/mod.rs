@@ -97,6 +97,10 @@ const ATTRS_LABEL: [wgpu::VertexAttribute; 2] =
 // Glyph cell height (px) and the per-frame line-vertex cap.
 const LABEL_PX: f32 = 24.0;
 const MAX_LABEL_VERTS: usize = 16384;
+// Satellite labels shrink with camera distance (Earth radii) and vanish past
+// LABEL_FAR, so they only read when you've zoomed in close to a body.
+const LABEL_NEAR: f32 = 0.4; // full size within this distance
+const LABEL_FAR: f32 = 1.6; // gone beyond this
 
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable)]
@@ -1411,11 +1415,6 @@ impl Renderer {
         width: f32,
         height: f32,
     ) -> Vec<mesh::LabelVertex> {
-        let unit = LABEL_PX / glyphs::GH; // px per grid unit (square)
-        let line_h = LABEL_PX + 5.0; // px between the two text lines
-        let off_x = LABEL_PX; // px from the marker to the text
-        let min_sep = LABEL_PX * 1.6; // declutter radius, px
-
         // Project every visible body; collect (camera distance, screen px, index).
         let mut cands: Vec<(f32, [f32; 2], usize)> = Vec::new();
         for i in 0..self.world.bodies.len() {
@@ -1443,27 +1442,40 @@ impl Renderer {
 
         let mut placed: Vec<[f32; 2]> = Vec::new();
         let mut out: Vec<mesh::LabelVertex> = Vec::new();
-        for (_, px, i) in cands {
+        for (dist, px, i) in cands {
+            // Distance fade: 1 within LABEL_NEAR, 0 past LABEL_FAR.
+            let fade = ((LABEL_FAR - dist) / (LABEL_FAR - LABEL_NEAR)).clamp(0.0, 1.0);
+            if fade < 0.12 {
+                continue; // too far / too small to read
+            }
+            // Label metrics shrink with the fade; declutter on the shrunk size.
+            let lpx = LABEL_PX * fade;
+            let unit = lpx / glyphs::GH;
+            let line_h = lpx + 5.0 * fade;
+            let min_sep = lpx * 1.6;
             if placed.iter().any(|q| (q[0] - px[0]).hypot(q[1] - px[1]) < min_sep) {
                 continue;
             }
             placed.push(px);
 
             let b = &self.world.bodies[i];
-            let ox = px[0] + off_x;
-            let oy = px[1] - LABEL_PX * 0.5;
+            // Fade colour out over the last bit of range for a soft vanish.
+            let cf = (fade / 0.35).min(1.0);
+            let col = [b.color[0] * cf, b.color[1] * cf, b.color[2] * cf];
+            let ox = px[0] + lpx;
+            let oy = px[1] - lpx * 0.5;
             let alt = (self.world.body_position_eci(i).length() - EARTH_RADIUS_KM).max(0.0);
             let (lat, lon) = self.world.body_latlon(i);
             let ns = if lat >= 0.0 { 'N' } else { 'S' };
             let ew = if lon >= 0.0 { 'E' } else { 'W' };
-            emit_text(&mut out, &b.name, ox, oy, b.color, unit, width, height);
-            emit_text(&mut out, &format!("{alt:.0} KM"), ox, oy + line_h, b.color, unit, width, height);
+            emit_text(&mut out, &b.name, ox, oy, col, unit, width, height);
+            emit_text(&mut out, &format!("{alt:.0} KM"), ox, oy + line_h, col, unit, width, height);
             emit_text(
                 &mut out,
                 &format!("{:.1}{ns} {:.1}{ew}", lat.abs(), lon.abs()),
                 ox,
                 oy + line_h * 2.0,
-                b.color,
+                col,
                 unit,
                 width,
                 height,
