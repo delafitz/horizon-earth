@@ -20,6 +20,10 @@ const LEN: f32 = 0.012; // triangle length along heading
 const HALF: f32 = 0.005; // half-width / rect half-size
 /// Below this speed (knots) a ship's course is meaningless → draw a rect.
 const MOVING_SOG_MIN: f64 = 0.5;
+/// Wake (stern tail) length in render units, scaled by speed-over-ground.
+const WAKE_PER_KNOT: f32 = 0.0009;
+const WAKE_MIN: f32 = 0.006;
+const WAKE_MAX: f32 = 0.022;
 
 // Amber, distinct from the frost-blue cities/coastlines.
 const COLOR_TANKER: [f32; 3] = [0.92, 0.62, 0.34];
@@ -77,10 +81,16 @@ pub fn build_geometry(tankers: &[Tanker]) -> (Vec<VertexPC>, Vec<VertexPC>) {
             let heading = north * cr.cos() + east * cr.sin();
             let side = up.cross(heading).normalize_or_zero();
             // Arrowhead: tip ahead along the course, two corners trailing.
+            let stern = p - heading * (LEN * 0.45);
             let tip = p + heading * LEN;
-            let bl = p - heading * (LEN * 0.45) + side * HALF;
-            let br = p - heading * (LEN * 0.45) - side * HALF;
+            let bl = stern + side * HALF;
+            let br = stern - side * HALF;
             push_tri(&mut tris, tip, bl, br, COLOR_TANKER);
+            // Immediate wake: a short tail off the stern, length scaled by
+            // speed. Complements the (slowly accumulating) historical track.
+            let wake = (t.sog as f32 * WAKE_PER_KNOT).clamp(WAKE_MIN, WAKE_MAX);
+            tracks.push(VertexPC { pos: stern.to_array(), col: COLOR_TRACK });
+            tracks.push(VertexPC { pos: (stern - heading * wake).to_array(), col: COLOR_TRACK });
         } else {
             // Stationary / no heading: a small axis-aligned rect (two tris).
             let n = if north_raw.length() > 1e-4 { north_raw.normalize() } else { Vec3::X };
