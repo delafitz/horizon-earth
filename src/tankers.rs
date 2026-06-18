@@ -16,8 +16,8 @@ use crate::renderer::mesh::VertexPC;
 /// Render radius for tanker geometry: just above the globe and land fill.
 const R: f32 = 1.0016;
 /// Marker dimensions in render units (Earth radius = 1).
-const LEN: f32 = 0.0085; // triangle length along heading
-const HALF: f32 = 0.0036; // half-width / rect half-size
+const LEN: f32 = 0.0072; // triangle length along heading
+const HALF: f32 = 0.0030; // half-width / rect half-size
 /// Below this speed (knots) a ship's course is meaningless → draw a rect.
 const MOVING_SOG_MIN: f64 = 0.5;
 /// Wake (stern tail) length in render units, scaled by speed-over-ground.
