@@ -511,6 +511,19 @@ impl ApplicationHandler for App {
                 }
             }
 
+            // Trackpad two-finger rotate -> roll the camera (tilt the horizon).
+            WindowEvent::RotationGesture { delta, .. } => {
+                if self.no_exit {
+                    if !egui_consumed {
+                        if let Some(r) = self.renderer.as_mut() {
+                            r.roll_camera(delta.to_radians());
+                        }
+                    }
+                } else {
+                    event_loop.exit();
+                }
+            }
+
             WindowEvent::CursorMoved { position, .. } => {
                 let pos = (position.x, position.y);
                 let prev = self.last_cursor.replace(pos);

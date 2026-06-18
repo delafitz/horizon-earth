@@ -27,9 +27,9 @@ pub struct EguiFrame<'a> {
 }
 
 // Natural Earth vector data, embedded so the binary is self-contained.
-const COASTLINE_GEOJSON: &str = include_str!("../../assets/earth/ne_110m_coastline.geojson");
+const COASTLINE_GEOJSON: &str = include_str!("../../assets/earth/ne_50m_coastline.geojson");
 const COUNTRIES_GEOJSON: &str =
-    include_str!("../../assets/earth/ne_110m_admin_0_countries.geojson");
+    include_str!("../../assets/earth/ne_50m_admin_0_countries.geojson");
 const CITIES_GEOJSON: &str =
     include_str!("../../assets/earth/ne_10m_populated_places.geojson");
 
@@ -1198,6 +1198,14 @@ impl Renderer {
     /// Dolly the fixed camera in (positive) or out (negative).
     pub fn zoom_camera(&mut self, factor: f32) {
         self.camera.orbit.zoom(factor as f64);
+    }
+
+    /// Roll the active camera about its view axis (radians) — two-finger rotate.
+    pub fn roll_camera(&mut self, delta: f32) {
+        match self.camera.mode {
+            horizon_core::CameraMode::Fixed => self.camera.orbit.roll += delta as f64,
+            horizon_core::CameraMode::Fly => self.camera.fly.roll += delta as f64,
+        }
     }
 
 

@@ -33,6 +33,8 @@ pub struct OrbitCamera {
     pub distance: f64,
     pub yaw: f64,
     pub pitch: f64,
+    /// Roll about the view axis (radians) — tilts the horizon.
+    pub roll: f64,
     pub fov_y: f64,
     pub near: f64,
     pub far: f64,
@@ -45,6 +47,7 @@ impl Default for OrbitCamera {
             distance: 2.79,
             yaw: 0.0,
             pitch: 0.253,
+            roll: 0.0,
             fov_y: 45f64.to_radians(),
             near: 0.05,
             far: 200.0,
@@ -62,7 +65,11 @@ impl OrbitCamera {
     }
 
     pub fn view(&self) -> DMat4 {
-        DMat4::look_at_rh(self.eye(), self.target, DVec3::Y)
+        // Roll the up hint about the view axis so the horizon tilts.
+        let eye = self.eye();
+        let fwd = (self.target - eye).normalize();
+        let up = DQuat::from_axis_angle(fwd, self.roll) * DVec3::Y;
+        DMat4::look_at_rh(eye, self.target, up)
     }
 
     pub fn view_proj(&self, aspect: f64) -> DMat4 {
