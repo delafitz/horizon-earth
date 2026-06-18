@@ -99,8 +99,12 @@ const LABEL_PX: f32 = 24.0;
 const MAX_LABEL_VERTS: usize = 16384;
 // Satellite labels shrink with camera distance (Earth radii) and vanish past
 // LABEL_FAR, so they only read when you've zoomed in close to a body.
-const LABEL_NEAR: f32 = 0.4; // full size within this distance
-const LABEL_FAR: f32 = 1.6; // gone beyond this
+const LABEL_NEAR: f32 = 2.0; // full size within this distance
+const LABEL_FAR: f32 = 3.0; // gone beyond this
+// Re-sample orbit tracks once the sim clock drifts this many seconds from the
+// last sampling, so J2 precession doesn't pull them off the satellites (~5°/day
+// at LEO, so ~4h keeps the drift under ~1°). Throttled, not per-frame.
+const TRACK_RESAMPLE_SECS: f64 = 4.0 * 3600.0;
 
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable)]
@@ -203,6 +207,9 @@ pub struct Renderer {
     // [egui] which categories currently have orbit tracks in `track_vbuf`;
     // rebuilt when the per-type selection changes.
     track_mask: u32,
+    /// Sim epoch the orbit tracks were last sampled at; re-sampled once the clock
+    /// drifts past `TRACK_RESAMPLE_SECS` so precession doesn't pull them off.
+    track_epoch: Epoch,
 }
 
 impl Renderer {
@@ -937,7 +944,7 @@ impl Renderer {
                 continue;
             }
             let col = [body.color[0] * 0.85, body.color[1] * 0.85, body.color[2] * 0.85];
-            let pts = sample_track(body.motion.as_ref(), 128);
+            let pts = sample_track(body.motion.as_ref(), world.current(), 128);
             for w in pts.windows(2) {
                 let a = eci_to_world(w[0]).as_vec3().to_array();
                 let b = eci_to_world(w[1]).as_vec3().to_array();
@@ -1024,6 +1031,8 @@ impl Renderer {
         // [egui] Painter targeting the same surface format; no depth, no MSAA.
         let egui_renderer = egui_wgpu::Renderer::new(&device, format, None, 1, false);
 
+        let track_epoch = world.current(); // tracks above were sampled at this epoch
+
         Renderer {
             surface,
             device,
@@ -1078,6 +1087,7 @@ impl Renderer {
             settings: RenderSettings::default(),
             // The track buffer above is built for every body (all categories on).
             track_mask: RenderSettings::default().track_mask(),
+            track_epoch,
         }
     }
 
@@ -1090,12 +1100,13 @@ impl Renderer {
                 continue;
             }
             let col = [body.color[0] * 0.85, body.color[1] * 0.85, body.color[2] * 0.85];
-            let pts = sample_track(body.motion.as_ref(), 128);
+            let pts = sample_track(body.motion.as_ref(), self.world.current(), 128);
             for w in pts.windows(2) {
                 verts.push(VertexPC { pos: eci_to_world(w[0]).as_vec3().to_array(), col });
                 verts.push(VertexPC { pos: eci_to_world(w[1]).as_vec3().to_array(), col });
             }
         }
+        self.track_epoch = self.world.current();
         self.track_vcount = verts.len() as u32;
         // Keep the old buffer when empty (zero-size buffers are invalid); the
         // zero vcount already suppresses the draw.
@@ -1153,6 +1164,11 @@ impl Renderer {
     /// Read-only access to the simulated world (for the UI panels).
     pub fn world(&self) -> &World {
         &self.world
+    }
+
+    /// Camera distance from Earth-center, in Earth radii (the zoom level).
+    pub fn camera_distance(&self) -> f64 {
+        self.camera.eye().length()
     }
 
     pub fn resize(&mut self, width: u32, height: u32) {
@@ -1380,7 +1396,11 @@ impl Renderer {
 
         // [egui] Rebuild orbit tracks only when the per-type selection changes.
         let mask = self.settings.track_mask();
-        if mask != self.track_mask {
+        // Re-sample when the visible set changes, or once the clock has drifted
+        // enough that orbit precession would visibly pull tracks off the sats.
+        let drifted =
+            self.world.current().seconds_since(self.track_epoch).abs() > TRACK_RESAMPLE_SECS;
+        if mask != self.track_mask || drifted {
             self.track_mask = mask;
             self.rebuild_tracks();
         }

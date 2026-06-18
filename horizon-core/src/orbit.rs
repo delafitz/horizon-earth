@@ -139,12 +139,13 @@ impl Propagator for Sgp4Orbit {
 }
 
 /// Sample a propagator's path as `segments + 1` ECI points over one period,
-/// starting at its own epoch — a closed loop suitable for an orbit track.
-pub fn sample_track<P: Propagator + ?Sized>(p: &P, segments: u32) -> Vec<DVec3> {
-    let start = p.epoch();
+/// starting at `from`. Pass the *current* simulation epoch (not the element-set
+/// epoch): SGP4 precesses the RAAN, so a track built at the TLE epoch drifts
+/// away from the satellite's actual position as the clock advances.
+pub fn sample_track<P: Propagator + ?Sized>(p: &P, from: Epoch, segments: u32) -> Vec<DVec3> {
     let period = p.period();
     (0..=segments)
-        .map(|k| start.plus_seconds(period * k as f64 / segments as f64))
+        .map(|k| from.plus_seconds(period * k as f64 / segments as f64))
         .map(|at| p.position_eci(at))
         .collect()
 }
@@ -195,7 +196,7 @@ mod tests {
     #[test]
     fn track_closes_on_itself() {
         let o = orbit();
-        let pts = sample_track(&o, 64);
+        let pts = sample_track(&o, o.epoch(), 64);
         assert_eq!(pts.len(), 65);
         assert!((pts[0] - pts[64]).length() < 1.0);
     }
