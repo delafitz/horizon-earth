@@ -29,6 +29,15 @@ pub struct RenderSettings {
     pub ground_width: f32,
     /// Ground-anchor opacity.
     pub ground_alpha: f32,
+    /// Base on-screen height of satellite name labels, in pixels (at full,
+    /// close-up size). The distance at which labels fade out scales off this.
+    pub label_size: f32,
+    /// Brightness multiplier on satellite label text.
+    pub label_intensity: f32,
+    /// Shared on-screen marker size multiplier across all satellite types.
+    pub marker_size: f32,
+    /// Shared brightness multiplier on satellite marker symbols.
+    pub marker_intensity: f32,
     /// Per-type attributes (visibility, symbol, size, labels, track, ground),
     /// indexed parallel to [`CATEGORIES`].
     pub types: [TypeStyle; CATEGORIES.len()],
@@ -53,8 +62,18 @@ pub struct RenderSettings {
     pub cities_min_pop: f32,
     /// City marker + label opacity.
     pub cities_alpha: f32,
+    /// Brightness multiplier for cities on the daylit side of the terminator.
+    pub cities_day_intensity: f32,
+    /// Brightness multiplier for cities on the night side of the terminator.
+    pub cities_night_intensity: f32,
     /// Whether city name labels are shown.
     pub cities_labels: bool,
+
+    // --- Lighting ---
+    /// Master toggle for the day/night terminator. When off, the globe, land
+    /// lines and cities are lit uniformly (no night dimming, cities at their
+    /// night intensity everywhere).
+    pub night_mode: bool,
 
     // --- Tankers (live AIS, from horizon-ais collector) ---
     pub tankers_show: bool,
@@ -74,6 +93,10 @@ impl Default for RenderSettings {
             sat_back_alpha: 0.15,
             ground_width: 1.5,
             ground_alpha: 0.5,
+            label_size: 24.0,
+            label_intensity: 1.0,
+            marker_size: 1.0,
+            marker_intensity: 1.0,
             types: default_types(),
             line_brightness: 1.0,
             line_back_alpha: 0.1,
@@ -85,7 +108,10 @@ impl Default for RenderSettings {
             cities_show: true,
             cities_min_pop: 100_000.0,
             cities_alpha: 0.85,
+            cities_day_intensity: 0.35,
+            cities_night_intensity: 1.0,
             cities_labels: false,
+            night_mode: true,
             tankers_show: true,
             show_atmosphere: true,
             atmo_intensity: 0.45,
@@ -109,12 +135,11 @@ impl RenderSettings {
         self.ty(cat).symbol.kind(cat)
     }
 
-    /// Per-type marker size multiplier — `0.0` when the type is hidden, which
+    /// Shared marker size multiplier — `0.0` when the type is hidden, which
     /// collapses its billboards to nothing.
     pub fn marker_scale(&self, cat: Category) -> f32 {
-        let t = self.ty(cat);
-        if t.visible {
-            t.size
+        if self.ty(cat).visible {
+            self.marker_size
         } else {
             0.0
         }
@@ -127,11 +152,25 @@ impl RenderSettings {
         t.visible && t.show_labels
     }
 
-    /// Whether ground anchors for category `cat` should be drawn (per-type
-    /// `ground`, gated by the type's master `visible`).
+    /// Whether the ground anchor (nadir drop-line) for category `cat` should be
+    /// drawn (per-type `ground`, gated by the type's master `visible`).
     pub fn ground_visible(&self, cat: Category) -> bool {
         let t = self.ty(cat);
         t.visible && t.show_ground
+    }
+
+    /// Whether the coverage zone (footprint ring) for category `cat` should be
+    /// drawn (per-type `coverage`, gated by the type's master `visible`).
+    pub fn coverage_visible(&self, cat: Category) -> bool {
+        let t = self.ty(cat);
+        t.visible && t.show_coverage
+    }
+
+    /// Whether the sub-satellite crosshatch (graticule-aligned "+") for category
+    /// `cat` should be drawn (per-type `crosshatch`, gated by `visible`).
+    pub fn crosshatch_visible(&self, cat: Category) -> bool {
+        let t = self.ty(cat);
+        t.visible && t.show_crosshatch
     }
 
     /// Whether orbit tracks for category `cat` should be drawn (hidden types
@@ -182,13 +221,16 @@ impl RenderSettings {
 pub struct TypeStyle {
     pub visible: bool,
     pub symbol: Symbol,
-    /// On-screen marker size multiplier for this type.
-    pub size: f32,
     /// Whether HUD labels are drawn for this type.
     pub show_labels: bool,
     pub show_track: bool,
-    /// Whether ground anchors (nadir line + footprint ring) are drawn.
+    /// Whether the ground anchor (nadir drop-line to the sub-satellite point)
+    /// is drawn.
     pub show_ground: bool,
+    /// Whether the coverage zone (footprint / horizon ring) is drawn.
+    pub show_coverage: bool,
+    /// Whether the sub-satellite crosshatch (graticule-aligned "+") is drawn.
+    pub show_crosshatch: bool,
     /// Max objects of this type to show (random subset). Capped at [`MAX_SAMPLE`].
     pub max_shown: usize,
 }
@@ -198,10 +240,11 @@ impl Default for TypeStyle {
         Self {
             visible: true,
             symbol: Symbol::Auto,
-            size: 1.0,
             show_labels: true,
             show_track: true,
             show_ground: true,
+            show_coverage: true,
+            show_crosshatch: false, // off by default — an extra mark, opt-in
             max_shown: DEFAULT_SHOWN,
         }
     }
@@ -438,6 +481,9 @@ fn properties_panel(ctx: &Context, ui: &mut UiState, world: &World) {
             let s = &mut ui.settings;
             p.add_space(6.0);
 
+            p.checkbox(&mut s.night_mode, "Day / night shading");
+            p.add_space(6.0);
+
             egui::CollapsingHeader::new("Satellites")
                 .default_open(true)
                 .show(p, |c| {
@@ -447,6 +493,20 @@ fn properties_panel(ctx: &Context, ui: &mut UiState, world: &World) {
                     c.add(
                         egui::Slider::new(&mut s.sat_back_alpha, 0.0..=1.0)
                             .text("far-side opacity"),
+                    );
+                    c.add(
+                        egui::Slider::new(&mut s.marker_size, 0.25..=4.0).text("symbol size ×"),
+                    );
+                    c.add(
+                        egui::Slider::new(&mut s.marker_intensity, 0.0..=2.0)
+                            .text("symbol intensity"),
+                    );
+                    c.add(
+                        egui::Slider::new(&mut s.label_size, 8.0..=48.0).text("label size px"),
+                    );
+                    c.add(
+                        egui::Slider::new(&mut s.label_intensity, 0.0..=2.0)
+                            .text("label intensity"),
                     );
 
                     egui::CollapsingHeader::new("Ground anchors")
@@ -494,10 +554,11 @@ fn properties_panel(ctx: &Context, ui: &mut UiState, world: &World) {
                                         }
                                     });
                             });
-                            b.add(egui::Slider::new(&mut t.size, 0.25..=4.0).text("size ×"));
                             b.checkbox(&mut t.show_labels, "labels");
                             b.checkbox(&mut t.show_track, "orbit track");
-                            b.checkbox(&mut t.show_ground, "ground anchors");
+                            b.checkbox(&mut t.show_ground, "ground anchor");
+                            b.checkbox(&mut t.show_coverage, "coverage zone");
+                            b.checkbox(&mut t.show_crosshatch, "crosshatch");
                         });
                     }
                 });
@@ -549,6 +610,14 @@ fn properties_panel(ctx: &Context, ui: &mut UiState, world: &World) {
                                 .text("min population"),
                         );
                         c.add(egui::Slider::new(&mut s.cities_alpha, 0.0..=1.0).text("opacity"));
+                        c.add(
+                            egui::Slider::new(&mut s.cities_night_intensity, 0.0..=2.0)
+                                .text("night intensity"),
+                        );
+                        c.add(
+                            egui::Slider::new(&mut s.cities_day_intensity, 0.0..=2.0)
+                                .text("day intensity"),
+                        );
                         c.checkbox(&mut s.cities_labels, "labels");
                     });
                 });

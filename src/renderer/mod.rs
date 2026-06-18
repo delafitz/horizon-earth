@@ -124,6 +124,11 @@ const RING_SEGMENTS: usize = 48;
 const GROUND_RADIUS: f32 = 1.0015;
 // Layer value selecting the ground width in the thick-line shader.
 const LAYER_GROUND: f32 = 2.0;
+// Optional sub-satellite crosshatch: a small "+" at the nadir point with arms
+// along the local meridian and parallel (graticule-aligned). Two segments per
+// body; `CROSS_HALF` is each arm's half-length in render units (Earth R = 1).
+const CROSS_SEGMENTS: usize = 2;
+const CROSS_HALF: f32 = 0.02;
 
 // On-screen half-size of a body marker, in NDC units.
 const MARKER_SIZE: f32 = 0.01;
@@ -959,8 +964,9 @@ impl Renderer {
             mapped_at_creation: false,
         });
 
-        // One nadir line + a footprint ring per body, refilled in `update`.
-        let ground_per_body = 1 + RING_SEGMENTS;
+        // One nadir line + a footprint ring + the crosshatch per body, refilled
+        // in `update`.
+        let ground_per_body = 1 + RING_SEGMENTS + CROSS_SEGMENTS;
         let ground_inst_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("ground-instances"),
             size: (world.bodies.len().max(1)
@@ -1174,7 +1180,8 @@ impl Renderer {
         // a larger body count overruns it in `update`.
         self.ground_inst_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("ground-instances"),
-            size: (n * (1 + RING_SEGMENTS) * std::mem::size_of::<mesh::ThickLineInstance>()) as u64,
+            size: (n * (1 + RING_SEGMENTS + CROSS_SEGMENTS)
+                * std::mem::size_of::<mesh::ThickLineInstance>()) as u64,
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -1353,6 +1360,7 @@ impl Renderer {
             .map(|i| {
                 let p = eci_to_world(self.world.body_position_eci(i)).as_vec3();
                 let b = &self.world.bodies[i];
+                let mi = self.settings.marker_intensity;
                 MarkerInstance {
                     center_size: [
                         p.x,
@@ -1362,7 +1370,7 @@ impl Renderer {
                             * b.category.size_scale()
                             * self.settings.marker_scale(b.category),
                     ],
-                    color: b.color,
+                    color: [b.color[0] * mi, b.color[1] * mi, b.color[2] * mi],
                     kind: self.settings.symbol_kind(b.category),
                 }
             })
@@ -1421,8 +1429,13 @@ impl Renderer {
         let unspin = glam::Mat3::from_rotation_y(-spin);
         let mut ground: Vec<mesh::ThickLineInstance> = Vec::new();
         for i in 0..self.world.bodies.len() {
-            // Per-type ground toggle (gated by the type's master visibility).
-            if !self.settings.ground_visible(self.world.bodies[i].category) {
+            // Ground anchor (nadir line) and coverage zone (footprint ring) are
+            // independent per-type toggles; skip the body only if neither shows.
+            let cat = self.world.bodies[i].category;
+            let anchor = self.settings.ground_visible(cat);
+            let coverage = self.settings.coverage_visible(cat);
+            let crosshatch = self.settings.crosshatch_visible(cat);
+            if !anchor && !coverage && !crosshatch {
                 continue;
             }
             let p = eci_to_world(self.world.body_position_eci(i)).as_vec3();
@@ -1440,25 +1453,45 @@ impl Renderer {
                     col_layer,
                 });
             };
-            // Nadir drop-line: from the satellite to the surface point below it.
-            push(&mut ground, p, n * GROUND_RADIUS);
-            // Footprint ring: the horizon circle, angular radius acos(R/r) about
+            // Ground anchor: nadir drop-line from the satellite to the surface
+            // point below it.
+            if anchor {
+                push(&mut ground, p, n * GROUND_RADIUS);
+            }
+            // Coverage zone: the horizon circle, angular radius acos(R/r) about
             // the nadir direction — so higher orbits draw visibly larger rings.
-            let theta = (1.0 / r).clamp(-1.0, 1.0).acos();
-            let seed = if n.x.abs() < 0.9 { Vec3::X } else { Vec3::Y };
-            let t = (seed - n * n.dot(seed)).normalize();
-            let bvec = n.cross(t);
-            let (st, ct) = theta.sin_cos();
-            let ring_pt = |phi: f32| {
-                let (sp, cp) = phi.sin_cos();
-                (n * ct + (t * cp + bvec * sp) * st) * GROUND_RADIUS
-            };
-            let mut prev = ring_pt(0.0);
-            for k in 1..=RING_SEGMENTS {
-                let phi = k as f32 / RING_SEGMENTS as f32 * std::f32::consts::TAU;
-                let cur = ring_pt(phi);
-                push(&mut ground, prev, cur);
-                prev = cur;
+            if coverage {
+                let theta = (1.0 / r).clamp(-1.0, 1.0).acos();
+                let seed = if n.x.abs() < 0.9 { Vec3::X } else { Vec3::Y };
+                let t = (seed - n * n.dot(seed)).normalize();
+                let bvec = n.cross(t);
+                let (st, ct) = theta.sin_cos();
+                let ring_pt = |phi: f32| {
+                    let (sp, cp) = phi.sin_cos();
+                    (n * ct + (t * cp + bvec * sp) * st) * GROUND_RADIUS
+                };
+                let mut prev = ring_pt(0.0);
+                for k in 1..=RING_SEGMENTS {
+                    let phi = k as f32 / RING_SEGMENTS as f32 * std::f32::consts::TAU;
+                    let cur = ring_pt(phi);
+                    push(&mut ground, prev, cur);
+                    prev = cur;
+                }
+            }
+            // Crosshatch: a small "+" at the nadir point, arms along the local
+            // meridian (north) and parallel (east) so it sits square on the
+            // lon/lat graticule. North is the pole axis projected into the
+            // tangent plane (falling back to any tangent at the poles).
+            if crosshatch {
+                let s = n * GROUND_RADIUS;
+                let mut north = Vec3::Y - n * n.dot(Vec3::Y);
+                if north.length_squared() < 1e-6 {
+                    north = Vec3::X - n * n.dot(Vec3::X); // n is along the pole
+                }
+                let north = north.normalize();
+                let east = n.cross(north); // unit (n ⟂ north)
+                push(&mut ground, s - north * CROSS_HALF, s + north * CROSS_HALF);
+                push(&mut ground, s - east * CROSS_HALF, s + east * CROSS_HALF);
             }
         }
         self.ground_count = ground.len() as u32;
@@ -1533,16 +1566,25 @@ impl Renderer {
         }
         cands.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
 
+        // Base label height (px) and intensity are user-driven. The fade clamp
+        // scales off the size: bigger labels stay readable farther out, so the
+        // near/far distances stretch proportionally from the LABEL_PX baseline.
+        let base_px = self.settings.label_size;
+        let zoom_scale = base_px / LABEL_PX;
+        let near = LABEL_NEAR * zoom_scale;
+        let far = LABEL_FAR * zoom_scale;
+        let intensity = self.settings.label_intensity;
+
         let mut placed: Vec<[f32; 2]> = Vec::new();
         let mut out: Vec<mesh::LabelVertex> = Vec::new();
         for (dist, px, i) in cands {
-            // Distance fade: 1 within LABEL_NEAR, 0 past LABEL_FAR.
-            let fade = ((LABEL_FAR - dist) / (LABEL_FAR - LABEL_NEAR)).clamp(0.0, 1.0);
+            // Distance fade: 1 within `near`, 0 past `far`.
+            let fade = ((far - dist) / (far - near)).clamp(0.0, 1.0);
             if fade < 0.12 {
                 continue; // too far / too small to read
             }
             // Label metrics shrink with the fade; declutter on the shrunk size.
-            let lpx = LABEL_PX * fade;
+            let lpx = base_px * fade;
             let unit = lpx / glyphs::GH;
             let line_h = lpx + 5.0 * fade;
             let min_sep = lpx * 1.6;
@@ -1552,8 +1594,9 @@ impl Renderer {
             placed.push(px);
 
             let b = &self.world.bodies[i];
-            // Fade colour out over the last bit of range for a soft vanish.
-            let cf = (fade / 0.35).min(1.0);
+            // Fade colour out over the last bit of range for a soft vanish, then
+            // scale by the user intensity.
+            let cf = (fade / 0.35).min(1.0) * intensity;
             let col = [b.color[0] * cf, b.color[1] * cf, b.color[2] * cf];
             let ox = px[0] + lpx;
             let oy = px[1] - lpx * 0.5;

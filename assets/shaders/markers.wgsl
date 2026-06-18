@@ -11,6 +11,7 @@ struct U {
     style1: vec4<f32>,
     style2: vec4<f32>, // z = far-side satellite-artifact alpha
     sun: vec4<f32>,    // xyz = sun direction, w = night brightness floor
+    style3: vec4<f32>, // x = city day intensity, y = city night intensity
 };
 @group(0) @binding(0) var<uniform> u: U;
 
@@ -145,7 +146,8 @@ fn fs_back(in: VOut) -> @location(0) vec4<f32> {
 @fragment
 fn fs_city(in: VOut) -> @location(0) vec4<f32> {
     let day = smoothstep(-0.12, 0.12, dot(normalize(in.world), u.sun.xyz));
-    let night_fade = mix(1.0, 0.35, day); // night = full, day = faded
+    // night side = style3.y (night intensity), day side = style3.x (day intensity).
+    let night_fade = mix(u.style3.y, u.style3.x, day);
     let a = marker_alpha(in.uv, in.kind) * u.style2.w * night_fade;
     if (a < 0.02) {
         discard;
