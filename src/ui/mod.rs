@@ -56,6 +56,9 @@ pub struct RenderSettings {
     /// Whether city name labels are shown.
     pub cities_labels: bool,
 
+    // --- Tankers (live AIS, from horizon-ais collector) ---
+    pub tankers_show: bool,
+
     // --- Atmosphere ---
     pub show_atmosphere: bool,
     /// Glow strength.
@@ -83,6 +86,7 @@ impl Default for RenderSettings {
             cities_min_pop: 100_000.0,
             cities_alpha: 0.85,
             cities_labels: false,
+            tankers_show: true,
             show_atmosphere: true,
             atmo_intensity: 0.45,
             atmo_thickness: 0.06,
@@ -208,19 +212,21 @@ pub const DEFAULT_SHOWN: usize = 100;
 /// Upper bound of the per-type "max shown" slider.
 pub const MAX_SAMPLE: usize = 300;
 
-/// Default per-type styles: only crewed stations start visible; the rest are
-/// toggled on from the panel as wanted (keeps the out-of-box view uncluttered).
+/// Default per-type styles: crewed stations and the (rare, notable) AST sats
+/// start visible; the rest are toggled on from the panel as wanted (keeps the
+/// out-of-box view uncluttered).
 fn default_types() -> [TypeStyle; CATEGORIES.len()] {
     let mut types = [TypeStyle::default(); CATEGORIES.len()];
     for (i, t) in types.iter_mut().enumerate() {
-        t.visible = CATEGORIES[i] == Category::Station;
+        t.visible = matches!(CATEGORIES[i], Category::Station | Category::Ast);
     }
     types
 }
 
 /// The categories shown (in order) in the per-type symbol editor.
-pub const CATEGORIES: [Category; 6] = [
+pub const CATEGORIES: [Category; 7] = [
     Category::Station,
+    Category::Ast,
     Category::Leo,
     Category::Starlink,
     Category::Gnss,
@@ -535,6 +541,13 @@ fn properties_panel(ctx: &Context, ui: &mut UiState, world: &World) {
                     });
                 });
 
+            egui::CollapsingHeader::new("Tankers")
+                .default_open(false)
+                .show(p, |c| {
+                    c.checkbox(&mut s.tankers_show, "visible");
+                    c.weak("live AIS — run the horizon-ais collector");
+                });
+
             egui::CollapsingHeader::new("Atmosphere")
                 .default_open(false)
                 .show(p, |c| {
@@ -665,6 +678,7 @@ fn nord(c: [f32; 3]) -> Color32 {
 fn category_label(c: Category) -> &'static str {
     match c {
         Category::Station => "Station",
+        Category::Ast => "AST",
         Category::Leo => "LEO",
         Category::Starlink => "Starlink",
         Category::Gnss => "GNSS",
