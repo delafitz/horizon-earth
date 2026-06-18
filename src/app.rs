@@ -228,6 +228,12 @@ impl App {
                 }
                 return;
             }
+            if s.eq_ignore_ascii_case("l") {
+                if let Some(r) = self.renderer.as_mut() {
+                    r.toggle_detail(); // coastline/border detail: 110m <-> 50m
+                }
+                return;
+            }
         }
 
         let Some(r) = self.renderer.as_mut() else {

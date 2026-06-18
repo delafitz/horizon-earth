@@ -27,9 +27,28 @@ pub struct EguiFrame<'a> {
 }
 
 // Natural Earth vector data, embedded so the binary is self-contained.
-const COASTLINE_GEOJSON: &str = include_str!("../../assets/earth/ne_50m_coastline.geojson");
-const COUNTRIES_GEOJSON: &str =
-    include_str!("../../assets/earth/ne_50m_admin_0_countries.geojson");
+// Two detail tiers, switchable at runtime (Detail::Low = 110m, High = 50m).
+const COASTLINE_110: &str = include_str!("../../assets/earth/ne_110m_coastline.geojson");
+const COUNTRIES_110: &str = include_str!("../../assets/earth/ne_110m_admin_0_countries.geojson");
+const COASTLINE_50: &str = include_str!("../../assets/earth/ne_50m_coastline.geojson");
+const COUNTRIES_50: &str = include_str!("../../assets/earth/ne_50m_admin_0_countries.geojson");
+
+/// Coastline / border vector detail tier.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Detail {
+    Low,  // Natural Earth 110m
+    High, // Natural Earth 50m
+}
+
+impl Detail {
+    /// (coastline, countries) GeoJSON for this tier.
+    fn data(self) -> (&'static str, &'static str) {
+        match self {
+            Detail::Low => (COASTLINE_110, COUNTRIES_110),
+            Detail::High => (COASTLINE_50, COUNTRIES_50),
+        }
+    }
+}
 const CITIES_GEOJSON: &str =
     include_str!("../../assets/earth/ne_10m_populated_places.geojson");
 
@@ -143,6 +162,10 @@ pub struct Renderer {
     uniform_buf: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
     mask_bind_group: wgpu::BindGroup,
+    // Land mask + detail tier, for switching coastline/border resolution at runtime.
+    mask_sh: wgpu::ShaderModule,
+    mask_tex: wgpu::Texture,
+    detail: Detail,
 
     starfield_pipeline: wgpu::RenderPipeline,
     globe_pipeline: wgpu::RenderPipeline,
@@ -335,14 +358,9 @@ impl Renderer {
         // Country polygons rasterised once into an equirectangular R8 texture,
         // sampled on the globe so the land fill conforms to the sphere with no
         // triangulation seams (the on-mesh fill is reduced to a stencil writer).
-        let mask_rings = crate::data::extract_polygon_rings(COUNTRIES_GEOJSON);
-        let mut mask_verts: Vec<[f32; 2]> = Vec::new();
-        crate::earth::build_land_mask_2d(&mask_rings, &mut mask_verts);
-        let mask_vbuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("land-mask-verts"),
-            contents: bytemuck::cast_slice(&mask_verts),
-            usage: wgpu::BufferUsages::VERTEX,
-        });
+        // Initial detail tier; switchable at runtime via set_detail().
+        let detail = Detail::High;
+        let (coast_json, countries_json) = detail.data();
         const MASK_W: u32 = 8192;
         const MASK_H: u32 = 4096;
         let mip_count = 32 - MASK_W.max(MASK_H).leading_zeros(); // floor(log2)+1
@@ -359,15 +377,6 @@ impl Renderer {
         // Full view (all mips) for sampling on the globe; per-level views for the
         // bake and mip-downsample passes.
         let mask_view = mask_tex.create_view(&wgpu::TextureViewDescriptor::default());
-        let level_views: Vec<wgpu::TextureView> = (0..mip_count)
-            .map(|l| {
-                mask_tex.create_view(&wgpu::TextureViewDescriptor {
-                    base_mip_level: l,
-                    mip_level_count: Some(1),
-                    ..Default::default()
-                })
-            })
-            .collect();
         let mask_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("land-mask-sampler"),
             address_mode_u: wgpu::AddressMode::Repeat, // longitude wraps
@@ -377,159 +386,7 @@ impl Renderer {
             mipmap_filter: wgpu::FilterMode::Linear, // trilinear: no zoom-out shimmer
             ..Default::default()
         });
-        let mask_vlayout = wgpu::VertexBufferLayout {
-            array_stride: std::mem::size_of::<[f32; 2]>() as u64,
-            step_mode: wgpu::VertexStepMode::Vertex,
-            attributes: &ATTRS_CORNER, // a single Float32x2 at location 0
-        };
-        let bake_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("mask-bake-layout"),
-            bind_group_layouts: &[],
-            push_constant_ranges: &[],
-        });
-        let bake_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("land-mask-bake"),
-            layout: Some(&bake_layout),
-            vertex: wgpu::VertexState {
-                module: &mask_sh,
-                entry_point: "vs_main",
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-                buffers: &[mask_vlayout],
-            },
-            primitive: wgpu::PrimitiveState::default(),
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            fragment: Some(wgpu::FragmentState {
-                module: &mask_sh,
-                entry_point: "fs_main",
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-                targets: &[Some(wgpu::TextureFormat::R8Unorm.into())],
-            }),
-            multiview: None,
-            cache: None,
-        });
-        // Downsample pipeline + per-level bind groups for mip generation.
-        let blit_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("mask-blit-sampler"),
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Linear,
-            ..Default::default()
-        });
-        let blit_bind_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("mask-blit-layout"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                    count: None,
-                },
-            ],
-        });
-        let blit_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("mask-blit-pipeline-layout"),
-            bind_group_layouts: &[&blit_bind_layout],
-            push_constant_ranges: &[],
-        });
-        let blit_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("mask-mip-blit"),
-            layout: Some(&blit_pl),
-            vertex: wgpu::VertexState {
-                module: &mask_sh,
-                entry_point: "vs_blit",
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-                buffers: &[],
-            },
-            primitive: wgpu::PrimitiveState::default(),
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            fragment: Some(wgpu::FragmentState {
-                module: &mask_sh,
-                entry_point: "fs_blit",
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-                targets: &[Some(wgpu::TextureFormat::R8Unorm.into())],
-            }),
-            multiview: None,
-            cache: None,
-        });
-        let blit_bgs: Vec<wgpu::BindGroup> = (1..mip_count as usize)
-            .map(|l| {
-                device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("mask-blit-bg"),
-                    layout: &blit_bind_layout,
-                    entries: &[
-                        wgpu::BindGroupEntry {
-                            binding: 0,
-                            resource: wgpu::BindingResource::TextureView(&level_views[l - 1]),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 1,
-                            resource: wgpu::BindingResource::Sampler(&blit_sampler),
-                        },
-                    ],
-                })
-            })
-            .collect();
-        {
-            let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("bake-land-mask"),
-            });
-            // Mip 0: rasterise the country polygons.
-            {
-                let mut rp = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label: Some("bake-land-mask"),
-                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: &level_views[0],
-                        resolve_target: None,
-                        ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), // 0 = ocean
-                            store: wgpu::StoreOp::Store,
-                        },
-                    })],
-                    depth_stencil_attachment: None,
-                    timestamp_writes: None,
-                    occlusion_query_set: None,
-                });
-                rp.set_pipeline(&bake_pipeline);
-                rp.set_vertex_buffer(0, mask_vbuf.slice(..));
-                rp.draw(0..mask_verts.len() as u32, 0..1);
-            }
-            // Remaining mips: downsample the previous level.
-            for (i, l) in (1..mip_count as usize).enumerate() {
-                let mut rp = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label: Some("mask-mip"),
-                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: &level_views[l],
-                        resolve_target: None,
-                        ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                            store: wgpu::StoreOp::Store,
-                        },
-                    })],
-                    depth_stencil_attachment: None,
-                    timestamp_writes: None,
-                    occlusion_query_set: None,
-                });
-                rp.set_pipeline(&blit_pipeline);
-                rp.set_bind_group(0, &blit_bgs[i], &[]);
-                rp.draw(0..3, 0..1);
-            }
-            queue.submit(std::iter::once(enc.finish()));
-        }
-        log::info!(
-            "baked {}x{} land mask ({} mips) from {} triangles",
-            MASK_W, MASK_H, mip_count, mask_verts.len() / 3
-        );
+        bake_mask_into(&device, &queue, &mask_sh, &mask_tex, countries_json);
 
         let mask_bind_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("land-mask-layout"),
@@ -849,8 +706,8 @@ impl Renderer {
         });
         let sphere_icount = sidx.len() as u32;
 
-        let coast = crate::data::extract_polylines(COASTLINE_GEOJSON);
-        let countries = crate::data::extract_polylines(COUNTRIES_GEOJSON);
+        let coast = crate::data::extract_polylines(coast_json);
+        let countries = crate::data::extract_polylines(countries_json);
         // One thick-line instance per segment. layer 1.0 = border, 0.0 = coast;
         // borders sit a hair below coastlines so coastlines win where they overlap.
         let mut line_insts: Vec<mesh::ThickLineInstance> = Vec::new();
@@ -880,7 +737,7 @@ impl Renderer {
 
         // Translucent land fill from the closed country rings, sitting just above
         // the globe surface and below the borders/coastlines.
-        let rings = crate::data::extract_polygon_rings(COUNTRIES_GEOJSON);
+        let rings = crate::data::extract_polygon_rings(countries_json);
         let mut fill_verts: Vec<VertexPC> = Vec::new();
         crate::earth::build_fill(
             &rings,
@@ -1042,6 +899,9 @@ impl Renderer {
             uniform_buf,
             bind_group,
             mask_bind_group,
+            mask_sh,
+            mask_tex,
+            detail,
             starfield_pipeline,
             globe_pipeline,
             fill_pipeline,
@@ -1117,6 +977,69 @@ impl Renderer {
                 usage: wgpu::BufferUsages::VERTEX,
             });
         }
+    }
+
+    /// Rebuild the coastline/border thick-line buffer for the current detail tier.
+    fn rebuild_lines(&mut self) {
+        let (coast_json, countries_json) = self.detail.data();
+        let coast = crate::data::extract_polylines(coast_json);
+        let countries = crate::data::extract_polylines(countries_json);
+        let mut insts: Vec<mesh::ThickLineInstance> = Vec::new();
+        crate::earth::build_thick_lines(&countries, COLOR_BORDER, 1.0, 1.0004, &mut insts);
+        crate::earth::build_thick_lines(&coast, COLOR_COAST, 0.0, 1.0007, &mut insts);
+        self.line_vcount = insts.len() as u32;
+        if !insts.is_empty() {
+            self.line_vbuf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("line-instances"),
+                contents: bytemuck::cast_slice(&insts),
+                usage: wgpu::BufferUsages::VERTEX,
+            });
+        }
+    }
+
+    /// Rebuild the land-fill stencil geometry for the current detail tier.
+    fn rebuild_fill(&mut self) {
+        let (_coast, countries_json) = self.detail.data();
+        let rings = crate::data::extract_polygon_rings(countries_json);
+        let mut verts: Vec<VertexPC> = Vec::new();
+        crate::earth::build_fill(
+            &rings,
+            COLOR_LAND,
+            1.0010,
+            FILL_SUBDIV_TOLERANCE_DEG.to_radians(),
+            &mut verts,
+        );
+        self.fill_vcount = verts.len() as u32;
+        if !verts.is_empty() {
+            self.fill_vbuf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("fill-verts"),
+                contents: bytemuck::cast_slice(&verts),
+                usage: wgpu::BufferUsages::VERTEX,
+            });
+        }
+    }
+
+    /// Switch the coastline/border/fill detail tier on the fly: rebuilds the line
+    /// and fill buffers and re-bakes the land mask (a brief hitch).
+    pub fn set_detail(&mut self, detail: Detail) {
+        if detail == self.detail {
+            return;
+        }
+        self.detail = detail;
+        let (_coast, countries_json) = detail.data();
+        self.rebuild_lines();
+        self.rebuild_fill();
+        bake_mask_into(&self.device, &self.queue, &self.mask_sh, &self.mask_tex, countries_json);
+        log::info!("detail tier -> {:?}", detail);
+    }
+
+    /// Toggle between the Low (110m) and High (50m) detail tiers.
+    pub fn toggle_detail(&mut self) {
+        let next = match self.detail {
+            Detail::Low => Detail::High,
+            Detail::High => Detail::Low,
+        };
+        self.set_detail(next);
     }
 
     /// [egui] Copy the current UI-driven parameters in; read during update/render.
@@ -1802,6 +1725,181 @@ fn shader(device: &wgpu::Device, label: &str, src: &str) -> wgpu::ShaderModule {
         label: Some(label),
         source: wgpu::ShaderSource::Wgsl(src.into()),
     })
+}
+
+/// Rasterise the country polygons of `countries_json` into `mask_tex` (mip 0,
+/// equirectangular) and generate its mip chain by repeated downsample blits.
+/// Used at startup and whenever the detail tier switches.
+fn bake_mask_into(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    mask_sh: &wgpu::ShaderModule,
+    mask_tex: &wgpu::Texture,
+    countries_json: &str,
+) {
+    let rings = crate::data::extract_polygon_rings(countries_json);
+    let mut verts: Vec<[f32; 2]> = Vec::new();
+    crate::earth::build_land_mask_2d(&rings, &mut verts);
+    let vbuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("land-mask-verts"),
+        contents: bytemuck::cast_slice(&verts),
+        usage: wgpu::BufferUsages::VERTEX,
+    });
+    let mip_count = mask_tex.mip_level_count();
+    let level_views: Vec<wgpu::TextureView> = (0..mip_count)
+        .map(|l| {
+            mask_tex.create_view(&wgpu::TextureViewDescriptor {
+                base_mip_level: l,
+                mip_level_count: Some(1),
+                ..Default::default()
+            })
+        })
+        .collect();
+    let vlayout = wgpu::VertexBufferLayout {
+        array_stride: std::mem::size_of::<[f32; 2]>() as u64,
+        step_mode: wgpu::VertexStepMode::Vertex,
+        attributes: &ATTRS_CORNER,
+    };
+    let bake_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("mask-bake-layout"),
+        bind_group_layouts: &[],
+        push_constant_ranges: &[],
+    });
+    let bake_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("land-mask-bake"),
+        layout: Some(&bake_layout),
+        vertex: wgpu::VertexState {
+            module: mask_sh,
+            entry_point: "vs_main",
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            buffers: &[vlayout],
+        },
+        primitive: wgpu::PrimitiveState::default(),
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState::default(),
+        fragment: Some(wgpu::FragmentState {
+            module: mask_sh,
+            entry_point: "fs_main",
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            targets: &[Some(wgpu::TextureFormat::R8Unorm.into())],
+        }),
+        multiview: None,
+        cache: None,
+    });
+    let blit_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+        label: Some("mask-blit-sampler"),
+        mag_filter: wgpu::FilterMode::Linear,
+        min_filter: wgpu::FilterMode::Linear,
+        ..Default::default()
+    });
+    let blit_bind_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("mask-blit-layout"),
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                count: None,
+            },
+        ],
+    });
+    let blit_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("mask-blit-pipeline-layout"),
+        bind_group_layouts: &[&blit_bind_layout],
+        push_constant_ranges: &[],
+    });
+    let blit_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("mask-mip-blit"),
+        layout: Some(&blit_pl),
+        vertex: wgpu::VertexState {
+            module: mask_sh,
+            entry_point: "vs_blit",
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            buffers: &[],
+        },
+        primitive: wgpu::PrimitiveState::default(),
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState::default(),
+        fragment: Some(wgpu::FragmentState {
+            module: mask_sh,
+            entry_point: "fs_blit",
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            targets: &[Some(wgpu::TextureFormat::R8Unorm.into())],
+        }),
+        multiview: None,
+        cache: None,
+    });
+    let blit_bgs: Vec<wgpu::BindGroup> = (1..mip_count as usize)
+        .map(|l| {
+            device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("mask-blit-bg"),
+                layout: &blit_bind_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&level_views[l - 1]),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Sampler(&blit_sampler),
+                    },
+                ],
+            })
+        })
+        .collect();
+    let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("bake-land-mask"),
+    });
+    {
+        let mut rp = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("bake-land-mask"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &level_views[0],
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+        });
+        rp.set_pipeline(&bake_pipeline);
+        rp.set_vertex_buffer(0, vbuf.slice(..));
+        rp.draw(0..verts.len() as u32, 0..1);
+    }
+    for (i, l) in (1..mip_count as usize).enumerate() {
+        let mut rp = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("mask-mip"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &level_views[l],
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+        });
+        rp.set_pipeline(&blit_pipeline);
+        rp.set_bind_group(0, &blit_bgs[i], &[]);
+        rp.draw(0..3, 0..1);
+    }
+    queue.submit(std::iter::once(enc.finish()));
+    log::info!("baked land mask ({} mips) from {} triangles", mip_count, verts.len() / 3);
 }
 
 fn create_depth_view(
