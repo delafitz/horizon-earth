@@ -49,6 +49,24 @@ impl Detail {
         }
     }
 }
+
+// Detail cross-fade. We launch on the low (110m) tier, build the high (50m) tier
+// on a background thread, and once it's resident dissolve between them based on
+// camera distance: high-res only when zoomed in past ~2 Earth radii (where the
+// extra vertices actually read), low-res when pulled back. The enter/exit radii
+// differ to keep the transition from flapping when you hover at the boundary.
+const BLEND_ENTER_R: f64 = 2.0; // closer than this -> fade up to high-res
+const BLEND_EXIT_R: f64 = 2.15; // farther than this -> fade back to low-res
+const BLEND_STEP: f32 = 0.05; // per-frame blend change (~0.4s fade at 60fps)
+
+/// CPU-built geometry for the high-detail tier, produced off-thread and handed
+/// to the renderer to upload (the heavy GeoJSON parse / triangulation is what
+/// made the synchronous switch hitch).
+struct HiTier {
+    line_insts: Vec<mesh::ThickLineInstance>,
+    fill_verts: Vec<VertexPC>,
+    mask_verts: Vec<[f32; 2]>,
+}
 const CITIES_GEOJSON: &str =
     include_str!("../../assets/earth/ne_10m_populated_places.geojson");
 
@@ -141,6 +159,7 @@ struct Uniforms {
     style2: [f32; 4], // x = ground-line width px, y = ground-line alpha,
     // z = far-side alpha for satellite layers (tracks/markers/ground)
     sun: [f32; 4], // xyz = sun direction (render frame), w = night brightness floor
+    style3: [f32; 4], // x = city day intensity, y = city night intensity
 }
 
 /// A city kept for rendering: earth-fixed position (spins with the globe) plus
@@ -161,11 +180,23 @@ pub struct Renderer {
 
     uniform_buf: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
+    // Second uniform/bind-group carrying params.w = 1-blend, used to draw the
+    // low detail tier's lines at the complementary cross-fade weight.
+    uniform_buf_lo: wgpu::Buffer,
+    bind_group_lo: wgpu::BindGroup,
     mask_bind_group: wgpu::BindGroup,
-    // Land mask + detail tier, for switching coastline/border resolution at runtime.
+    // Two land-mask tiers (low baked at startup, high baked once it arrives off
+    // the background thread); the globe cross-fades them by the blend factor.
     mask_sh: wgpu::ShaderModule,
-    mask_tex: wgpu::Texture,
-    detail: Detail,
+    // High tier is re-baked once the background build lands; the low tier is
+    // baked once at startup and kept alive by its view in `mask_bind_group`.
+    mask_tex_high: wgpu::Texture,
+    // Detail cross-fade state: 0 = low/110m, 1 = high/50m. `hi_ready` flips once
+    // the background build has been uploaded; `hires_enabled` is the 'L' override.
+    blend: f32,
+    hi_ready: bool,
+    hires_enabled: bool,
+    hi_rx: Option<std::sync::mpsc::Receiver<HiTier>>,
 
     starfield_pipeline: wgpu::RenderPipeline,
     globe_pipeline: wgpu::RenderPipeline,
@@ -188,8 +219,12 @@ pub struct Renderer {
     sphere_icount: u32,
 
     line_quad_vbuf: wgpu::Buffer,
+    // Low tier resident from startup; high tier filled in once the background
+    // build lands. Both drawn during a cross-fade, weighted by `blend`.
     line_vbuf: wgpu::Buffer,
     line_vcount: u32,
+    line_vbuf_high: wgpu::Buffer,
+    line_vcount_high: u32,
 
     // Ground anchors (nadir lines + footprint rings), rebuilt each frame since
     // the satellites move. Shares `line_quad_vbuf` for the expansion quad.
@@ -198,6 +233,8 @@ pub struct Renderer {
 
     fill_vbuf: wgpu::Buffer,
     fill_vcount: u32,
+    fill_vbuf_high: wgpu::Buffer,
+    fill_vcount_high: u32,
 
     track_vbuf: wgpu::Buffer,
     track_vcount: u32,
@@ -334,6 +371,24 @@ impl Renderer {
             }],
         });
 
+        // A second uniform identical to the primary except params.w = 1-blend,
+        // bound when drawing the low detail tier's lines so they fade out as the
+        // high tier (drawn with the primary, params.w = blend) fades in.
+        let uniform_buf_lo = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("uniforms-lo"),
+            size: std::mem::size_of::<Uniforms>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let bind_group_lo = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("uniform-bind-group-lo"),
+            layout: &bind_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: uniform_buf_lo.as_entire_binding(),
+            }],
+        });
+
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("pipeline-layout"),
             bind_group_layouts: &[&bind_layout],
@@ -358,13 +413,15 @@ impl Renderer {
         // Country polygons rasterised once into an equirectangular R8 texture,
         // sampled on the globe so the land fill conforms to the sphere with no
         // triangulation seams (the on-mesh fill is reduced to a stencil writer).
-        // Initial detail tier; switchable at runtime via set_detail().
-        let detail = Detail::High;
+        // Launch on the low (110m) tier — its mask + lines are cheap to bake, so
+        // startup is fast; the high (50m) tier is built on a background thread
+        // (below) and cross-faded in once resident.
+        let detail = Detail::Low;
         let (coast_json, countries_json) = detail.data();
         const MASK_W: u32 = 8192;
         const MASK_H: u32 = 4096;
         let mip_count = 32 - MASK_W.max(MASK_H).leading_zeros(); // floor(log2)+1
-        let mask_tex = device.create_texture(&wgpu::TextureDescriptor {
+        let mask_desc = wgpu::TextureDescriptor {
             label: Some("land-mask"),
             size: wgpu::Extent3d { width: MASK_W, height: MASK_H, depth_or_array_layers: 1 },
             mip_level_count: mip_count,
@@ -373,10 +430,14 @@ impl Renderer {
             format: wgpu::TextureFormat::R8Unorm,
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
             view_formats: &[],
-        });
-        // Full view (all mips) for sampling on the globe; per-level views for the
-        // bake and mip-downsample passes.
-        let mask_view = mask_tex.create_view(&wgpu::TextureViewDescriptor::default());
+        };
+        // One mask texture per tier; the globe samples both and blends them.
+        let mask_tex_low = device.create_texture(&mask_desc);
+        let mask_tex_high = device.create_texture(&mask_desc);
+        // Full views (all mips) for sampling on the globe; per-level views are
+        // made inside the bake for the bake + mip-downsample passes.
+        let mask_view_low = mask_tex_low.create_view(&wgpu::TextureViewDescriptor::default());
+        let mask_view_high = mask_tex_high.create_view(&wgpu::TextureViewDescriptor::default());
         let mask_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("land-mask-sampler"),
             address_mode_u: wgpu::AddressMode::Repeat, // longitude wraps
@@ -386,23 +447,27 @@ impl Renderer {
             mipmap_filter: wgpu::FilterMode::Linear, // trilinear: no zoom-out shimmer
             ..Default::default()
         });
-        bake_mask_into(&device, &queue, &mask_sh, &mask_tex, countries_json);
+        // Bake the low tier now; the high texture stays zero-initialised (the
+        // globe never weights it until `hi_ready`, after its bake below).
+        bake_mask_into(&device, &queue, &mask_sh, &mask_tex_low, countries_json);
 
+        let tex_entry = |binding| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Texture {
+                sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                view_dimension: wgpu::TextureViewDimension::D2,
+                multisampled: false,
+            },
+            count: None,
+        };
         let mask_bind_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("land-mask-layout"),
             entries: &[
+                tex_entry(0), // low tier
+                tex_entry(1), // high tier
                 wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
+                    binding: 2,
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
@@ -413,8 +478,9 @@ impl Renderer {
             label: Some("land-mask-bind-group"),
             layout: &mask_bind_layout,
             entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&mask_view) },
-                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&mask_sampler) },
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&mask_view_low) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&mask_view_high) },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&mask_sampler) },
             ],
         });
         // The globe samples the mask, so it needs both bind groups.
@@ -541,10 +607,14 @@ impl Renderer {
             Some(wgpu::BlendState::ALPHA_BLENDING), false,
             wgpu::CompareFunction::Greater, "fs_back",
         );
+        // Alpha-blended (was opaque): the near coastlines/borders now carry the
+        // detail-tier cross-fade weight in their alpha, so the low and high tiers
+        // dissolve into each other across the LOD distance.
         let lines_pipeline = make_pipeline(
             &device, &pipeline_layout, &thick_lines_sh, format,
             &[corner_layout.clone(), thick_inst_layout.clone()],
-            wgpu::PrimitiveTopology::TriangleList, None, true,
+            wgpu::PrimitiveTopology::TriangleList,
+            Some(wgpu::BlendState::ALPHA_BLENDING), true,
             wgpu::CompareFunction::LessEqual, "fs_main",
         );
         // Ground anchors (nadir lines + footprint rings): same thick-line shader,
@@ -754,6 +824,48 @@ impl Renderer {
         });
         let fill_vcount = fill_verts.len() as u32;
 
+        // High-tier line/fill buffers start empty (one-vertex placeholders, since
+        // zero-sized buffers are invalid); the background build fills them in and
+        // flips `hi_ready`. The high mask texture stays zero-initialised until then.
+        let line_vbuf_high = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("line-instances-high"),
+            size: std::mem::size_of::<mesh::ThickLineInstance>() as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let fill_vbuf_high = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("fill-verts-high"),
+            size: std::mem::size_of::<VertexPC>() as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        // Build the high (50m) tier off-thread: the GeoJSON parse, thick-line
+        // expansion, fill triangulation and mask vertex build are all pure CPU
+        // work on the 'static embedded data, so the worker just ships the vecs
+        // back over a channel for the main thread to upload + bake.
+        let (hi_tx, hi_rx) = std::sync::mpsc::channel::<HiTier>();
+        std::thread::spawn(move || {
+            let (coast_json, countries_json) = Detail::High.data();
+            let coast = crate::data::extract_polylines(coast_json);
+            let countries = crate::data::extract_polylines(countries_json);
+            let mut line_insts: Vec<mesh::ThickLineInstance> = Vec::new();
+            crate::earth::build_thick_lines(&countries, COLOR_BORDER, 1.0, 1.0004, &mut line_insts);
+            crate::earth::build_thick_lines(&coast, COLOR_COAST, 0.0, 1.0007, &mut line_insts);
+            let rings = crate::data::extract_polygon_rings(countries_json);
+            let mut fill_verts: Vec<VertexPC> = Vec::new();
+            crate::earth::build_fill(
+                &rings,
+                COLOR_LAND,
+                1.0010,
+                FILL_SUBDIV_TOLERANCE_DEG.to_radians(),
+                &mut fill_verts,
+            );
+            let mut mask_verts: Vec<[f32; 2]> = Vec::new();
+            crate::earth::build_land_mask_2d(&rings, &mut mask_verts);
+            let _ = hi_tx.send(HiTier { line_insts, fill_verts, mask_verts });
+        });
+
         // --- Orbiting bodies -------------------------------------------------
         let camera = CameraRig::default();
         // `world` is supplied by the caller (real tracked objects or the demo
@@ -898,10 +1010,15 @@ impl Renderer {
             depth_view,
             uniform_buf,
             bind_group,
+            uniform_buf_lo,
+            bind_group_lo,
             mask_bind_group,
             mask_sh,
-            mask_tex,
-            detail,
+            mask_tex_high,
+            blend: 0.0,
+            hi_ready: false,
+            hires_enabled: true,
+            hi_rx: Some(hi_rx),
             starfield_pipeline,
             globe_pipeline,
             fill_pipeline,
@@ -923,10 +1040,14 @@ impl Renderer {
             line_quad_vbuf,
             line_vbuf,
             line_vcount,
+            line_vbuf_high,
+            line_vcount_high: 0,
             ground_inst_buf,
             ground_count: 0,
             fill_vbuf,
             fill_vcount,
+            fill_vbuf_high,
+            fill_vcount_high: 0,
             track_vbuf,
             track_vcount,
             marker_quad_vbuf,
@@ -979,67 +1100,57 @@ impl Renderer {
         }
     }
 
-    /// Rebuild the coastline/border thick-line buffer for the current detail tier.
-    fn rebuild_lines(&mut self) {
-        let (coast_json, countries_json) = self.detail.data();
-        let coast = crate::data::extract_polylines(coast_json);
-        let countries = crate::data::extract_polylines(countries_json);
-        let mut insts: Vec<mesh::ThickLineInstance> = Vec::new();
-        crate::earth::build_thick_lines(&countries, COLOR_BORDER, 1.0, 1.0004, &mut insts);
-        crate::earth::build_thick_lines(&coast, COLOR_COAST, 0.0, 1.0007, &mut insts);
-        self.line_vcount = insts.len() as u32;
-        if !insts.is_empty() {
-            self.line_vbuf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("line-instances"),
-                contents: bytemuck::cast_slice(&insts),
-                usage: wgpu::BufferUsages::VERTEX,
-            });
+    /// Poll the background high-tier build; when it lands, upload the line/fill
+    /// buffers and bake the high mask, then flip `hi_ready` so the cross-fade can
+    /// engage. Runs once per frame (cheap until the single message arrives).
+    fn poll_hi_tier(&mut self) {
+        let Some(rx) = self.hi_rx.take() else { return };
+        match rx.try_recv() {
+            Ok(hi) => {
+                self.line_vbuf_high = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("line-instances-high"),
+                    contents: bytemuck::cast_slice(&hi.line_insts),
+                    usage: wgpu::BufferUsages::VERTEX,
+                });
+                self.line_vcount_high = hi.line_insts.len() as u32;
+                self.fill_vbuf_high = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("fill-verts-high"),
+                    contents: bytemuck::cast_slice(&hi.fill_verts),
+                    usage: wgpu::BufferUsages::VERTEX,
+                });
+                self.fill_vcount_high = hi.fill_verts.len() as u32;
+                bake_verts_into(&self.device, &self.queue, &self.mask_sh, &self.mask_tex_high, &hi.mask_verts);
+                self.hi_ready = true;
+                log::info!(
+                    "high-detail tier ready ({} line segments, {} fill verts)",
+                    self.line_vcount_high, self.fill_vcount_high
+                );
+            }
+            // Not built yet: keep the receiver for next frame.
+            Err(std::sync::mpsc::TryRecvError::Empty) => self.hi_rx = Some(rx),
+            // Worker died without sending: give up (stay on the low tier).
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {}
         }
     }
 
-    /// Rebuild the land-fill stencil geometry for the current detail tier.
-    fn rebuild_fill(&mut self) {
-        let (_coast, countries_json) = self.detail.data();
-        let rings = crate::data::extract_polygon_rings(countries_json);
-        let mut verts: Vec<VertexPC> = Vec::new();
-        crate::earth::build_fill(
-            &rings,
-            COLOR_LAND,
-            1.0010,
-            FILL_SUBDIV_TOLERANCE_DEG.to_radians(),
-            &mut verts,
-        );
-        self.fill_vcount = verts.len() as u32;
-        if !verts.is_empty() {
-            self.fill_vbuf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("fill-verts"),
-                contents: bytemuck::cast_slice(&verts),
-                usage: wgpu::BufferUsages::VERTEX,
-            });
-        }
+    /// Ease the detail cross-fade toward its target each frame. The target is
+    /// high (1.0) only when high-res is enabled, resident, and the camera is
+    /// closer than the LOD distance (with enter/exit hysteresis); otherwise low.
+    fn step_blend(&mut self) {
+        let dist = self.camera.eye().length();
+        let threshold = if self.blend > 0.5 { BLEND_EXIT_R } else { BLEND_ENTER_R };
+        let want_hi = self.hires_enabled && self.hi_ready && dist < threshold;
+        let target: f32 = if want_hi { 1.0 } else { 0.0 };
+        let d = (target - self.blend).clamp(-BLEND_STEP, BLEND_STEP);
+        self.blend = (self.blend + d).clamp(0.0, 1.0);
     }
 
-    /// Switch the coastline/border/fill detail tier on the fly: rebuilds the line
-    /// and fill buffers and re-bakes the land mask (a brief hitch).
-    pub fn set_detail(&mut self, detail: Detail) {
-        if detail == self.detail {
-            return;
-        }
-        self.detail = detail;
-        let (_coast, countries_json) = detail.data();
-        self.rebuild_lines();
-        self.rebuild_fill();
-        bake_mask_into(&self.device, &self.queue, &self.mask_sh, &self.mask_tex, countries_json);
-        log::info!("detail tier -> {:?}", detail);
-    }
-
-    /// Toggle between the Low (110m) and High (50m) detail tiers.
-    pub fn toggle_detail(&mut self) {
-        let next = match self.detail {
-            Detail::Low => Detail::High,
-            Detail::High => Detail::Low,
-        };
-        self.set_detail(next);
+    /// Allow / suppress the high-detail tier ('L'). When suppressed the view
+    /// fades back to the low tier regardless of zoom; re-enabling lets the
+    /// zoom-driven cross-fade take over again.
+    pub fn toggle_hires(&mut self) {
+        self.hires_enabled = !self.hires_enabled;
+        log::info!("high-detail tier {}", if self.hires_enabled { "enabled" } else { "disabled" });
     }
 
     /// [egui] Copy the current UI-driven parameters in; read during update/render.
@@ -1179,6 +1290,11 @@ impl Renderer {
     pub fn update(&mut self, now: Epoch) {
         self.world.set_time(now);
 
+        // Detail LOD: take delivery of the background high-tier build (once), then
+        // ease the cross-fade toward where the current zoom wants it.
+        self.poll_hi_tier();
+        self.step_blend();
+
         let width = self.config.width as f32;
         let height = self.config.height.max(1) as f32;
         let aspect = width / height;
@@ -1199,7 +1315,9 @@ impl Renderer {
             view_proj: view_proj.to_cols_array_2d(),
             model: model.to_cols_array_2d(),
             cam_pos: [eye.x, eye.y, eye.z, 1.0],
-            params: [aspect, width, height, 0.0],
+            // params.w = detail cross-fade (0 = low/110m, 1 = high/50m): the globe
+            // blends the two masks by it, and the high-tier lines fade by it.
+            params: [aspect, width, height, self.blend],
             style0: [s.line_back_alpha, s.fill_alpha, s.track_alpha, s.line_brightness],
             // z = coastline width px, w = border width px (0 hides the layer).
             style1: [
@@ -1209,10 +1327,25 @@ impl Renderer {
                 s.border_width_px(),
             ],
             style2: [s.ground_width_px(), s.ground_alpha, s.sat_back_alpha, s.cities_alpha],
-            sun: [sun.x, sun.y, sun.z, NIGHT_DIM],
+            // Night floor: NIGHT_DIM lights the dark side normally; 1.0 disables
+            // the terminator entirely (uniform daylight) when night mode is off.
+            sun: [sun.x, sun.y, sun.z, if s.night_mode { NIGHT_DIM } else { 1.0 }],
+            // City day/night brightness. With night mode off, the daylit value
+            // collapses to the night value so cities glow uniformly.
+            style3: [
+                if s.night_mode { s.cities_day_intensity } else { s.cities_night_intensity },
+                s.cities_night_intensity,
+                0.0,
+                0.0,
+            ],
         };
         self.queue
             .write_buffer(&self.uniform_buf, 0, bytemuck::cast_slice(&[u]));
+        // Complementary uniform for the low tier's lines: params.w = 1-blend.
+        let mut u_lo = u;
+        u_lo.params[3] = 1.0 - self.blend;
+        self.queue
+            .write_buffer(&self.uniform_buf_lo, 0, bytemuck::cast_slice(&[u_lo]));
 
         // Refresh marker instances from the current orbit positions (ECI/km ->
         // render frame).
@@ -1557,13 +1690,27 @@ impl Renderer {
             let body_count = self.world.bodies.len() as u32;
 
             // --- Far side (behind the globe surface): faint, "through glass" --
-            // Coastlines + borders (instanced thick-line quads).
-            if self.line_vcount > 0 {
+            // Coastlines + borders, cross-faded between detail tiers: the low
+            // tier draws with the 1-blend uniform (bind_group_lo), the high tier
+            // with the primary blend uniform. Either is skipped when its weight
+            // ~0. The shaders carry the fade in their alpha (params.w).
+            let draw_low = self.line_vcount > 0 && self.blend < 0.999;
+            let draw_high = self.hi_ready && self.line_vcount_high > 0 && self.blend > 0.001;
+            if draw_low {
+                rp.set_bind_group(0, &self.bind_group_lo, &[]);
                 rp.set_pipeline(&self.lines_back_pipeline);
                 rp.set_vertex_buffer(0, self.line_quad_vbuf.slice(..));
                 rp.set_vertex_buffer(1, self.line_vbuf.slice(..));
                 rp.draw(0..6, 0..self.line_vcount);
             }
+            if draw_high {
+                rp.set_bind_group(0, &self.bind_group, &[]);
+                rp.set_pipeline(&self.lines_back_pipeline);
+                rp.set_vertex_buffer(0, self.line_quad_vbuf.slice(..));
+                rp.set_vertex_buffer(1, self.line_vbuf_high.slice(..));
+                rp.draw(0..6, 0..self.line_vcount_high);
+            }
+            rp.set_bind_group(0, &self.bind_group, &[]); // restore primary
 
             // Orbit tracks.
             if self.track_vcount > 0 {
@@ -1589,20 +1736,37 @@ impl Renderer {
             }
 
             // --- Near side: full intensity -----------------------------------
-            // Translucent land fill, under the coastlines/borders.
-            if self.fill_vcount > 0 {
+            // Land-fill stencil (writes no colour, just stamps land for city
+            // clipping). It's invisible, so rather than cross-fade it we use the
+            // tier the blend currently favours, switching at the midpoint.
+            let (fill_buf, fill_count) = if self.blend >= 0.5 && self.hi_ready {
+                (&self.fill_vbuf_high, self.fill_vcount_high)
+            } else {
+                (&self.fill_vbuf, self.fill_vcount)
+            };
+            if fill_count > 0 {
                 rp.set_pipeline(&self.fill_pipeline);
-                rp.set_vertex_buffer(0, self.fill_vbuf.slice(..));
-                rp.draw(0..self.fill_vcount, 0..1);
+                rp.set_vertex_buffer(0, fill_buf.slice(..));
+                rp.draw(0..fill_count, 0..1);
             }
 
-            // Coastlines + borders (instanced thick-line quads).
-            if self.line_vcount > 0 {
+            // Coastlines + borders, cross-faded (low via bind_group_lo, high via
+            // the primary), mirroring the far-side pass above.
+            if draw_low {
+                rp.set_bind_group(0, &self.bind_group_lo, &[]);
                 rp.set_pipeline(&self.lines_pipeline);
                 rp.set_vertex_buffer(0, self.line_quad_vbuf.slice(..));
                 rp.set_vertex_buffer(1, self.line_vbuf.slice(..));
                 rp.draw(0..6, 0..self.line_vcount);
             }
+            if draw_high {
+                rp.set_bind_group(0, &self.bind_group, &[]);
+                rp.set_pipeline(&self.lines_pipeline);
+                rp.set_vertex_buffer(0, self.line_quad_vbuf.slice(..));
+                rp.set_vertex_buffer(1, self.line_vbuf_high.slice(..));
+                rp.draw(0..6, 0..self.line_vcount_high);
+            }
+            rp.set_bind_group(0, &self.bind_group, &[]); // restore primary
 
             // Ground anchors (nadir drop-lines + footprint rings), near side.
             if self.ground_count > 0 {
@@ -1727,9 +1891,9 @@ fn shader(device: &wgpu::Device, label: &str, src: &str) -> wgpu::ShaderModule {
     })
 }
 
-/// Rasterise the country polygons of `countries_json` into `mask_tex` (mip 0,
-/// equirectangular) and generate its mip chain by repeated downsample blits.
-/// Used at startup and whenever the detail tier switches.
+/// Build the land-mask vertices for `countries_json` and rasterise them into
+/// `mask_tex`. The startup/low path; the high tier builds its verts off-thread
+/// and calls [`bake_verts_into`] directly.
 fn bake_mask_into(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
@@ -1740,9 +1904,21 @@ fn bake_mask_into(
     let rings = crate::data::extract_polygon_rings(countries_json);
     let mut verts: Vec<[f32; 2]> = Vec::new();
     crate::earth::build_land_mask_2d(&rings, &mut verts);
+    bake_verts_into(device, queue, mask_sh, mask_tex, &verts);
+}
+
+/// Rasterise pre-built land-mask triangles into `mask_tex` (mip 0,
+/// equirectangular) and generate its mip chain by repeated downsample blits.
+fn bake_verts_into(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    mask_sh: &wgpu::ShaderModule,
+    mask_tex: &wgpu::Texture,
+    verts: &[[f32; 2]],
+) {
     let vbuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("land-mask-verts"),
-        contents: bytemuck::cast_slice(&verts),
+        contents: bytemuck::cast_slice(verts),
         usage: wgpu::BufferUsages::VERTEX,
     });
     let mip_count = mask_tex.mip_level_count();

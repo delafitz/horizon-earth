@@ -230,7 +230,7 @@ impl App {
             }
             if s.eq_ignore_ascii_case("l") {
                 if let Some(r) = self.renderer.as_mut() {
-                    r.toggle_detail(); // coastline/border detail: 110m <-> 50m
+                    r.toggle_hires(); // allow/suppress the high-detail (50m) tier
                 }
                 return;
             }

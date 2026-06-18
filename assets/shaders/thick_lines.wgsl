@@ -75,13 +75,16 @@ fn vs_main(
 
 @fragment
 fn fs_main(in: VOut) -> @location(0) vec4<f32> {
-    return vec4<f32>(in.col * u.style0.w * shade(in.world), 1.0);
+    // Alpha carries the detail-tier cross-fade weight (params.w): the renderer
+    // draws the low tier with 1-blend and the high tier with blend so they
+    // dissolve into each other as the camera crosses the LOD distance.
+    return vec4<f32>(in.col * u.style0.w * shade(in.world), u.params.w);
 }
 
 // Far-hemisphere variant: faint, alpha-blended (seen "through the glass").
 @fragment
 fn fs_back(in: VOut) -> @location(0) vec4<f32> {
-    return vec4<f32>(in.col * u.style0.w, u.style0.x);
+    return vec4<f32>(in.col * u.style0.w, u.style0.x * u.params.w);
 }
 
 // Ground anchors (nadir lines + footprint rings): alpha-blended in the body's

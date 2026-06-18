@@ -12,8 +12,10 @@ struct U {
     sun: vec4<f32>, // xyz = sun direction, w = night brightness floor
 };
 @group(0) @binding(0) var<uniform> u: U;
-@group(1) @binding(0) var land_mask: texture_2d<f32>;
-@group(1) @binding(1) var land_samp: sampler;
+// Two detail tiers, cross-faded by params.w (0 = low/110m, 1 = high/50m).
+@group(1) @binding(0) var land_lo: texture_2d<f32>;
+@group(1) @binding(1) var land_hi: texture_2d<f32>;
+@group(1) @binding(2) var land_samp: sampler;
 
 struct VOut {
     @builtin(position) clip: vec4<f32>,
@@ -52,7 +54,10 @@ fn fs_main(in: VOut) -> @location(0) vec4<f32> {
     let lon = atan2(-g.z, g.x);
     let lat = asin(clamp(g.y, -1.0, 1.0));
     let uv = vec2<f32>(lon / 6.2831853 + 0.5, 0.5 - lat / 3.14159265);
-    let land = textureSample(land_mask, land_samp, uv).r;
+    // Cross-fade the two detail tiers (params.w: 0 = low, 1 = high).
+    let lo = textureSample(land_lo, land_samp, uv).r;
+    let hi = textureSample(land_hi, land_samp, uv).r;
+    let land = mix(lo, hi, u.params.w);
     let land_col = vec3<f32>(0.263, 0.298, 0.369); // Nord3-ish land tint
     let surface = mix(base, land_col, land);
     // Ocean stays translucent (0.35); land opacity rides the fill slider so it
