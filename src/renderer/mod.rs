@@ -99,8 +99,8 @@ const LABEL_PX: f32 = 24.0;
 const MAX_LABEL_VERTS: usize = 16384;
 // Satellite labels shrink with camera distance (Earth radii) and vanish past
 // LABEL_FAR, so they only read when you've zoomed in close to a body.
-const LABEL_NEAR: f32 = 2.0; // full size within this distance
-const LABEL_FAR: f32 = 3.0; // gone beyond this
+const LABEL_NEAR: f32 = 1.5; // full size within this distance
+const LABEL_FAR: f32 = 2.5; // gone beyond this
 // Re-sample orbit tracks once the sim clock drifts this many seconds from the
 // last sampling, so J2 precession doesn't pull them off the satellites (~5°/day
 // at LEO, so ~4h keeps the drift under ~1°). Throttled, not per-frame.
