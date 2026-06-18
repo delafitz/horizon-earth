@@ -19,6 +19,7 @@ struct VOut {
     @builtin(position) clip: vec4<f32>,
     @location(0) nrm: vec3<f32>,
     @location(1) geo: vec3<f32>, // earth-fixed (pre-model) normal, for lon/lat
+    @location(2) world: vec3<f32>,
 };
 
 @vertex
@@ -27,6 +28,7 @@ fn vs_main(@location(0) pos: vec3<f32>, @location(1) nrm: vec3<f32>) -> VOut {
     let world = (u.model * vec4<f32>(pos, 1.0)).xyz;
     o.nrm = normalize((u.model * vec4<f32>(nrm, 0.0)).xyz);
     o.geo = normalize(nrm);
+    o.world = world;
     o.clip = u.view_proj * vec4<f32>(world, 1.0);
     return o;
 }
@@ -34,6 +36,12 @@ fn vs_main(@location(0) pos: vec3<f32>, @location(1) nrm: vec3<f32>) -> VOut {
 @fragment
 fn fs_main(in: VOut) -> @location(0) vec4<f32> {
     let N = normalize(in.nrm);
+    // Draw only the near hemisphere. The sphere has no back-face culling, so
+    // without this the far surface blends through the translucent near surface,
+    // and the high-contrast day/night terminator turns that into banding.
+    if (dot(N, normalize(u.cam_pos.xyz - in.world)) <= 0.0) {
+        discard;
+    }
     let L = normalize(u.sun.xyz);
     // Day/night terminator: night floor (sun.w) -> full across a soft band.
     let lit = mix(u.sun.w, 1.0, smoothstep(-0.12, 0.12, dot(N, L)));
