@@ -82,6 +82,9 @@ pub struct App {
     egui_ctx: egui::Context,
     egui_state: Option<egui_winit::State>,
     ui: UiState,
+    /// Demo time-scale in effect at the last frame; a change re-baselines the
+    /// clock so adjusting the slider doesn't jump the simulation.
+    last_time_scale: f64,
     last_frame: Instant,
     fps: f32,
 }
@@ -106,6 +109,7 @@ impl App {
             egui_ctx: egui::Context::default(),
             egui_state: None,
             ui: UiState::new(!demo, DEFAULT_TIME_SCALE),
+            last_time_scale: DEFAULT_TIME_SCALE,
             last_frame: Instant::now(),
             fps: 0.0,
         }
@@ -117,7 +121,7 @@ impl App {
             TimeMode::Live => now_epoch(),
             TimeMode::Demo => self
                 .epoch0
-                .plus_seconds(self.start.elapsed().as_secs_f64() * DEFAULT_TIME_SCALE),
+                .plus_seconds(self.start.elapsed().as_secs_f64() * self.ui.time_scale),
         }
     }
 
@@ -259,6 +263,18 @@ impl App {
             self.time_mode = want;
             self.start = Instant::now();
             self.epoch0 = now_epoch();
+        }
+
+        // Re-baseline the demo clock when the time-scale slider changes so the
+        // simulation continues from its current instant instead of jumping.
+        if self.ui.time_scale != self.last_time_scale {
+            if self.time_mode == TimeMode::Demo {
+                self.epoch0 = self
+                    .epoch0
+                    .plus_seconds(self.start.elapsed().as_secs_f64() * self.last_time_scale);
+                self.start = Instant::now();
+            }
+            self.last_time_scale = self.ui.time_scale;
         }
 
         // Re-sample the group when a per-type "max shown" slider committed.
