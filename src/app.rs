@@ -87,6 +87,11 @@ pub struct App {
     last_time_scale: f64,
     last_frame: Instant,
     fps: f32,
+
+    // [tankers] Reload cache/tankers.json (from the horizon-ais collector) when
+    // it changes; `mtime` gates re-reads, `check_at` throttles the stat call.
+    tanker_mtime: Option<SystemTime>,
+    tanker_check_at: Instant,
 }
 
 impl App {
@@ -112,6 +117,8 @@ impl App {
             last_time_scale: DEFAULT_TIME_SCALE,
             last_frame: Instant::now(),
             fps: 0.0,
+            tanker_mtime: None,
+            tanker_check_at: Instant::now(),
         }
     }
 
@@ -285,6 +292,23 @@ impl App {
             let world = self.world_from_caps(&caps);
             if let Some(r) = self.renderer.as_mut() {
                 r.set_world(world);
+            }
+        }
+
+        // [tankers] Reload the AIS cache when the collector rewrites it (stat
+        // throttled to a few seconds; rebuild only on an mtime change).
+        if Instant::now() >= self.tanker_check_at {
+            self.tanker_check_at = Instant::now() + Duration::from_secs(3);
+            let path = Path::new("cache/tankers.json");
+            let mtime = std::fs::metadata(path).and_then(|m| m.modified()).ok();
+            if mtime != self.tanker_mtime {
+                self.tanker_mtime = mtime;
+                let tankers = crate::tankers::load(path);
+                let (tris, tracks) = crate::tankers::build_geometry(&tankers);
+                log::info!("loaded {} tankers", tankers.len());
+                if let Some(r) = self.renderer.as_mut() {
+                    r.set_tankers(tris, tracks);
+                }
             }
         }
 

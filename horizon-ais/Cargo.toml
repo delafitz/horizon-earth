@@ -1,0 +1,17 @@
+[package]
+name = "horizon-ais"
+version = "0.1.0"
+edition = "2021"
+description = "AISStream collector: live tanker positions -> cache/tankers.json"
+
+[[bin]]
+name = "horizon-ais"
+path = "src/main.rs"
+
+[dependencies]
+# native-tls builds cleanly on macOS (Security.framework); on the Linux/niri
+# target it uses system OpenSSL. Swap to features = ["rustls-tls-webpki-roots"]
+# for a self-contained TLS stack with no system dependency.
+tungstenite = { version = "0.24", features = ["native-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

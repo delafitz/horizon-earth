@@ -181,6 +181,15 @@ pub struct Renderer {
     city_inst_buf: wgpu::Buffer,
     city_count: u32,
 
+    // [tankers] Live AIS layer: surface markers (triangles/rects) + tracks,
+    // rebuilt from cache/tankers.json on reload. Earth-fixed (drawn with model).
+    tanker_pipeline: wgpu::RenderPipeline,
+    tanker_track_pipeline: wgpu::RenderPipeline,
+    tanker_vbuf: wgpu::Buffer,
+    tanker_count: u32,
+    tanker_track_vbuf: wgpu::Buffer,
+    tanker_track_count: u32,
+
     camera: CameraRig,
     world: World,
 
@@ -867,6 +876,33 @@ impl Renderer {
             mapped_at_creation: false,
         });
 
+        // [tankers] Surface markers + tracks (plain pos+colour, model-spun).
+        // Depth-tested but non-writing, so the globe occludes the far side and
+        // they sit just above the surface. Buffers (re)filled by `set_tankers`.
+        let tanker_sh = shader(&device, "tanker", include_str!("../../assets/shaders/tanker.wgsl"));
+        let tanker_pipeline = make_pipeline(
+            &device, &pipeline_layout, &tanker_sh, format, &[pc_layout.clone()],
+            wgpu::PrimitiveTopology::TriangleList,
+            Some(wgpu::BlendState::ALPHA_BLENDING), false,
+            wgpu::CompareFunction::LessEqual, "fs_main",
+        );
+        let tanker_track_pipeline = make_pipeline(
+            &device, &pipeline_layout, &tanker_sh, format, &[pc_layout.clone()],
+            wgpu::PrimitiveTopology::LineList,
+            Some(wgpu::BlendState::ALPHA_BLENDING), false,
+            wgpu::CompareFunction::LessEqual, "fs_track",
+        );
+        let empty_tanker = |label| {
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(label),
+                size: std::mem::size_of::<VertexPC>() as u64,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            })
+        };
+        let tanker_vbuf = empty_tanker("tanker-verts");
+        let tanker_track_vbuf = empty_tanker("tanker-track-verts");
+
         // [egui] Painter targeting the same surface format; no depth, no MSAA.
         let egui_renderer = egui_wgpu::Renderer::new(&device, format, None, 1, false);
 
@@ -912,6 +948,12 @@ impl Renderer {
             city_pipeline,
             city_inst_buf,
             city_count: 0,
+            tanker_pipeline,
+            tanker_track_pipeline,
+            tanker_vbuf,
+            tanker_count: 0,
+            tanker_track_vbuf,
+            tanker_track_count: 0,
             camera,
             world,
             egui_renderer,
@@ -965,6 +1007,29 @@ impl Renderer {
             mapped_at_creation: false,
         });
         self.rebuild_tracks();
+    }
+
+    /// [tankers] Replace tanker marker + track geometry (built from
+    /// cache/tankers.json by `crate::tankers`). Empty input keeps the prior
+    /// buffer with a zero count (the draw is skipped).
+    pub fn set_tankers(&mut self, tris: Vec<VertexPC>, tracks: Vec<VertexPC>) {
+        self.tanker_count = tris.len() as u32;
+        if !tris.is_empty() {
+            self.tanker_vbuf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("tanker-verts"),
+                contents: bytemuck::cast_slice(&tris),
+                usage: wgpu::BufferUsages::VERTEX,
+            });
+        }
+        self.tanker_track_count = tracks.len() as u32;
+        if !tracks.is_empty() {
+            self.tanker_track_vbuf =
+                self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("tanker-track-verts"),
+                    contents: bytemuck::cast_slice(&tracks),
+                    usage: wgpu::BufferUsages::VERTEX,
+                });
+        }
     }
 
     /// Read-only access to the simulated world (for the UI panels).
@@ -1482,6 +1547,21 @@ impl Renderer {
                 rp.set_vertex_buffer(0, self.marker_quad_vbuf.slice(..));
                 rp.set_vertex_buffer(1, self.city_inst_buf.slice(..));
                 rp.draw(0..6, 0..self.city_count);
+            }
+
+            // [tankers] Surface tracks then direction-aware markers (near side;
+            // depth-tested so the globe hides the far hemisphere).
+            if self.settings.tankers_show {
+                if self.tanker_track_count > 0 {
+                    rp.set_pipeline(&self.tanker_track_pipeline);
+                    rp.set_vertex_buffer(0, self.tanker_track_vbuf.slice(..));
+                    rp.draw(0..self.tanker_track_count, 0..1);
+                }
+                if self.tanker_count > 0 {
+                    rp.set_pipeline(&self.tanker_pipeline);
+                    rp.set_vertex_buffer(0, self.tanker_vbuf.slice(..));
+                    rp.draw(0..self.tanker_count, 0..1);
+                }
             }
 
             // Bodies in front, drawn last so they read crisply.

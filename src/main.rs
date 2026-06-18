@@ -9,6 +9,7 @@ mod app;
 mod data;
 mod earth;
 mod renderer;
+mod tankers;
 mod ui;
 
 use winit::event_loop::{ControlFlow, EventLoop};

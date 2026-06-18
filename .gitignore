@@ -3,6 +3,9 @@
 # Rust
 /target
 
+# Stray log files (e.g. `horizon-ais 2>&1 | tee ais.log`)
+*.log
+
 # Runtime caches (e.g. downloaded TLE data in later phases)
 /cache/*
 !/cache/.gitkeep
