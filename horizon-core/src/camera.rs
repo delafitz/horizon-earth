@@ -92,6 +92,8 @@ const FLY_ALT_MIN: f64 = 120.0; // km — keep the eye above the surface
 const FLY_ALT_MAX: f64 = 40_000.0;
 const FLY_SPEED_MIN: f64 = 0.0;
 const FLY_SPEED_MAX: f64 = 3.0; // rad/s along the orbit
+const FLY_FOV_MIN: f64 = 0.2618; // ~15° — zoomed-in ("telephoto") look
+const FLY_FOV_MAX: f64 = 1.5708; // ~90° — wide-angle look
 
 /// A camera that rides a circular orbit and looks along its velocity vector,
 /// with free yaw/pitch/roll offsets. The orbit is parameterised like a TLE:
@@ -211,6 +213,11 @@ impl FlyCamera {
 
     pub fn adjust_raan(&mut self, delta: f64) {
         self.raan = (self.raan + delta).rem_euclid(std::f64::consts::TAU);
+    }
+
+    /// Zoom the look by narrowing/widening the vertical field of view (radians).
+    pub fn adjust_fov(&mut self, delta: f64) {
+        self.fov_y = (self.fov_y + delta).clamp(FLY_FOV_MIN, FLY_FOV_MAX);
     }
 }
 

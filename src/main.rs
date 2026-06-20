@@ -92,8 +92,13 @@ fn main() {
     let opts = Options::resolve();
 
     // `RUST_LOG` still wins if set; otherwise --verbose picks the default level.
-    let default_level = if opts.verbose { "info" } else { "warn" };
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(default_level)).init();
+    // Silence two harmless startup warnings from desktop services that may be
+    // absent on a bare Wayland session (e.g. niri): sctk-adwaita's portal
+    // color-scheme probe and arboard's X11 clipboard fallback. Neither affects
+    // rendering. `RUST_LOG` overrides this entirely.
+    let level = if opts.verbose { "info" } else { "warn" };
+    let default_filter = format!("{level},sctk_adwaita=off,egui_winit::clipboard=off");
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(default_filter)).init();
 
     let event_loop = EventLoop::new().expect("failed to create event loop");
     // Poll continuously so the globe animates every frame.

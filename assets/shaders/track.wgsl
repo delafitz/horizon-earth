@@ -10,7 +10,10 @@ struct U {
     params: vec4<f32>,
     style0: vec4<f32>, // [egui] z = orbit-track alpha (near)
     style1: vec4<f32>,
-    style2: vec4<f32>, // z = far-side satellite-artifact alpha
+    style2: vec4<f32>,
+    sun: vec4<f32>,
+    style3: vec4<f32>,
+    style4: vec4<f32>, // x = far-side orbit-track alpha
 };
 @group(0) @binding(0) var<uniform> u: U;
 
@@ -35,5 +38,5 @@ fn fs_main(in: VOut) -> @location(0) vec4<f32> {
 // Far side (behind the translucent globe): fainter, seen "through the glass".
 @fragment
 fn fs_back(in: VOut) -> @location(0) vec4<f32> {
-    return vec4<f32>(in.col, u.style0.z * u.style2.z);
+    return vec4<f32>(in.col, u.style0.z * u.style4.x);
 }

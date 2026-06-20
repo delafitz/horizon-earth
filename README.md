@@ -74,10 +74,26 @@ Each flag has an equivalent environment variable; either one enables it
 | `--offline`       | `HORIZON_OFFLINE=1`   | Skip the network; use cached TLEs (or the demo constellation) |
 | `-v, --verbose`   | `RUST_LOG=info`       | Verbose logging (default is `warn`) |
 
-In interactive mode (`--no-exit`), left-drag orbits the camera, scroll zooms,
-and **T** toggles live/demo time. Real satellites are fetched from CelesTrak and
-cached under `cache/`; if the fetch fails the app falls back to a synthetic
-constellation.
+In interactive mode (`--no-exit`), **T** toggles live/demo time, **F** switches
+between the fixed (Earth-centred) and fly (orbit-riding) cameras, and **@**
+toggles the HUD overlay (satellite labels, fly banner, and the egui panels) for a
+clean view.
+
+The trackpad drives the camera in both modes:
+
+| Gesture | Fixed camera | Fly camera |
+|---|---|---|
+| Two-finger scroll | Orbit the globe | Look around (yaw/pitch) |
+| Shift + scroll | Zoom | Orbit altitude |
+| Ctrl + scroll | Roll the horizon | Zoom the look (FOV) |
+| Two-finger rotate | Roll | Roll |
+| Pinch | Zoom | Orbit altitude |
+
+In fly mode the keyboard adds speed (Z/X), inclination (C/V) and RAAN (B/N); the
+in-app banner lists the full set.
+
+Real satellites are fetched from CelesTrak and cached under `cache/`; if the
+fetch fails the app falls back to a synthetic constellation.
 
 ```sh
 cargo run -- --windowed --no-exit
