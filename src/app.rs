@@ -87,6 +87,13 @@ pub struct App {
     last_time_scale: f64,
     last_frame: Instant,
     fps: f32,
+    /// Process CPU-usage meter (sampled from /proc on Linux) for the HUD.
+    cpu: CpuMeter,
+    /// HUD perf readouts, refreshed once a second so the numbers stay readable.
+    hud_fps: f32,
+    hud_cpu: f32,
+    hud_gpu: Option<f32>,
+    hud_at: Instant,
 
     // [tankers] Reload cache/tankers.json (from the horizon-ais collector) when
     // it changes; `mtime` gates re-reads, `check_at` throttles the stat call.
@@ -117,6 +124,11 @@ impl App {
             last_time_scale: DEFAULT_TIME_SCALE,
             last_frame: Instant::now(),
             fps: 0.0,
+            cpu: CpuMeter::new(),
+            hud_fps: 0.0,
+            hud_cpu: 0.0,
+            hud_gpu: None,
+            hud_at: Instant::now(),
             tanker_mtime: None,
             tanker_check_at: Instant::now(),
         }
@@ -209,6 +221,7 @@ impl App {
     /// Interactive keyboard shortcuts (not consumed by egui).
     ///   T          toggle live/demo time (reconciled via `ui.live`)
     ///   F          toggle Fixed (Earth-centred) / Fly (orbit-riding) camera
+    ///   @          toggle the HUD overlay (labels, fly banner, egui panels)
     /// Fly mode only:
     ///   arrows     yaw (left/right), pitch (up/down)
     ///   Q / E      roll
@@ -218,6 +231,10 @@ impl App {
     ///   B / N      RAAN          -/+
     fn handle_shortcut(&mut self, key: &Key) {
         if let Key::Character(s) = key {
+            if s == "@" {
+                self.ui.settings.hud = !self.ui.settings.hud;
+                return;
+            }
             if s.eq_ignore_ascii_case("t") {
                 self.ui.live = !self.ui.live;
                 return;
@@ -344,15 +361,30 @@ impl App {
         renderer.advance_camera(dt);
         renderer.update(now);
 
+        // Refresh the perf readouts once a second so FPS/CPU/GPU stay legible
+        // instead of flickering every frame.
+        let cpu_pct = self.cpu.sample();
+        if self.hud_at.elapsed() >= Duration::from_secs(1) {
+            self.hud_fps = self.fps;
+            self.hud_cpu = cpu_pct;
+            self.hud_gpu = renderer.gpu_ms();
+            self.hud_at = Instant::now();
+        }
+
         // Build the egui overlay. The world is borrowed read-only for the UI
         // pass, then released before the mutable render call below.
-        let egui_data = if self.no_exit {
+        let egui_data = if self.no_exit && self.ui.settings.hud {
             self.egui_state.as_mut().map(|state| {
                 let raw = state.take_egui_input(&window);
                 let info = ui::FrameInfo {
-                    fps: self.fps,
+                    fps: self.hud_fps,
                     gmst_deg: renderer.world().earth_rotation().to_degrees(),
+                    heading_deg: renderer.camera_heading_deg(),
+                    velocity_kms: renderer.camera_velocity_kms(),
+                    altitude_km: renderer.camera_altitude_km(),
                     zoom: renderer.camera_distance(),
+                    cpu_pct: self.hud_cpu,
+                    gpu_ms: self.hud_gpu,
                 };
                 let ui_state = &mut self.ui;
                 let world = renderer.world();
@@ -458,15 +490,26 @@ impl ApplicationHandler for App {
 
             WindowEvent::KeyboardInput { event, .. } => {
                 if event.state == ElementState::Pressed {
-                    let escape = matches!(event.logical_key, Key::Named(NamedKey::Escape));
-                    if escape || !self.no_exit {
-                        event_loop.exit();
-                        return;
-                    }
-                    // Interactive-only shortcuts (skipped when egui is using the
-                    // key, e.g. typing in the filter box).
-                    if !egui_consumed {
-                        self.handle_shortcut(&event.logical_key);
+                    // A lone modifier isn't real "activity" — niri delivers it as
+                    // a key press, which would otherwise quit the screensaver the
+                    // instant you touch Ctrl/Shift/Alt/Super.
+                    let bare_modifier = matches!(
+                        event.logical_key,
+                        Key::Named(
+                            NamedKey::Control | NamedKey::Shift | NamedKey::Alt | NamedKey::Super
+                        )
+                    );
+                    if !bare_modifier {
+                        let escape = matches!(event.logical_key, Key::Named(NamedKey::Escape));
+                        if escape || !self.no_exit {
+                            event_loop.exit();
+                            return;
+                        }
+                        // Interactive-only shortcuts (skipped when egui is using
+                        // the key, e.g. typing in the filter box).
+                        if !egui_consumed {
+                            self.handle_shortcut(&event.logical_key);
+                        }
                     }
                 }
             }
@@ -500,15 +543,27 @@ impl ApplicationHandler for App {
                     };
                     let mods = self.modifiers;
                     if let Some(r) = self.renderer.as_mut() {
-                        // Fixed/realtime mode only; fly mode is keyboard-driven.
-                        if !r.is_fly_mode() {
-                            const ROT: f32 = 0.005; // rad per pixel
-                            if mods.shift_key() {
-                                // Shift: orbit the view — the whole scene (Earth
-                                // + the satellites attached to it) turns together.
-                                r.orbit_camera(-dx * ROT, dy * ROT);
+                        const ROT: f32 = 0.005; // rad per pixel
+                        if r.is_fly_mode() {
+                            // Plain scroll looks around (yaw/pitch); Shift trades
+                            // it for orbit altitude (scroll up = climb); Ctrl
+                            // zooms the look (scroll up = narrow FOV / zoom in).
+                            if mods.control_key() {
+                                r.fly_adjust_fov(-dy * ROT);
+                            } else if mods.shift_key() {
+                                r.fly_adjust_altitude(dy * 4.0);
                             } else {
-                                r.zoom_camera(dy * 0.002); // plain: scroll up = zoom in
+                                r.fly_look(dx * ROT, dy * ROT, 0.0);
+                            }
+                        } else {
+                            // Plain scroll orbits the globe; Shift zooms; Ctrl
+                            // rolls the horizon.
+                            if mods.control_key() {
+                                r.roll_camera(dx * ROT);
+                            } else if mods.shift_key() {
+                                r.zoom_camera(dy * 0.002); // scroll up = zoom in
+                            } else {
+                                r.orbit_camera(-dx * ROT, dy * ROT);
                             }
                         }
                     }
@@ -523,6 +578,24 @@ impl ApplicationHandler for App {
                     if !egui_consumed {
                         if let Some(r) = self.renderer.as_mut() {
                             r.roll_camera(delta.to_radians());
+                        }
+                    }
+                } else {
+                    event_loop.exit();
+                }
+            }
+
+            // Trackpad pinch: fly mode changes orbit altitude (spread = climb);
+            // fixed mode zooms the globe (spread = zoom in).
+            WindowEvent::PinchGesture { delta, .. } => {
+                if self.no_exit {
+                    if !egui_consumed {
+                        if let Some(r) = self.renderer.as_mut() {
+                            if r.is_fly_mode() {
+                                r.fly_adjust_altitude(delta as f32 * 1200.0);
+                            } else {
+                                r.zoom_camera(delta as f32 * 1.5);
+                            }
                         }
                     }
                 } else {
@@ -569,4 +642,63 @@ impl ApplicationHandler for App {
             w.request_redraw();
         }
     }
+}
+
+/// Process CPU-usage meter. Samples this process's CPU time from `/proc/self/stat`
+/// (Linux) and divides the delta by wall-clock time, so the figure is "cores
+/// busy" as a percentage (can exceed 100% across the render + data threads). On
+/// non-Linux it stays at 0. Updated a few times a second to read steadily.
+struct CpuMeter {
+    last_ticks: u64,
+    last_at: Instant,
+    pct: f32,
+}
+
+impl CpuMeter {
+    fn new() -> Self {
+        Self {
+            last_ticks: read_proc_cpu_ticks().unwrap_or(0),
+            last_at: Instant::now(),
+            pct: 0.0,
+        }
+    }
+
+    /// Return the latest CPU% (refreshing the running average once a second).
+    fn sample(&mut self) -> f32 {
+        let Some(ticks) = read_proc_cpu_ticks() else {
+            return self.pct;
+        };
+        let now = Instant::now();
+        let dt = now.duration_since(self.last_at).as_secs_f32();
+        if dt >= 1.0 {
+            // USER_HZ is 100 on essentially all Linux configs, so ticks → seconds
+            // is /100. `dt` is wall time over the same window.
+            let busy_secs = ticks.saturating_sub(self.last_ticks) as f32 / 100.0;
+            self.pct = (busy_secs / dt) * 100.0;
+            self.last_ticks = ticks;
+            self.last_at = now;
+        }
+        self.pct
+    }
+}
+
+/// Sum of this process's user + system CPU time in clock ticks, or `None` off
+/// Linux. Fields 14 (utime) and 15 (stime) of `/proc/self/stat`, parsed after the
+/// `comm` field (which may itself contain spaces/parens, so split past the last
+/// `)`).
+#[cfg(target_os = "linux")]
+fn read_proc_cpu_ticks() -> Option<u64> {
+    let stat = std::fs::read_to_string("/proc/self/stat").ok()?;
+    let after_comm = &stat[stat.rfind(')')? + 1..];
+    let fields: Vec<&str> = after_comm.split_whitespace().collect();
+    // After the ')' the next token is field 3 (state), so utime/stime (14/15) are
+    // at indices 11 and 12.
+    let utime: u64 = fields.get(11)?.parse().ok()?;
+    let stime: u64 = fields.get(12)?.parse().ok()?;
+    Some(utime + stime)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn read_proc_cpu_ticks() -> Option<u64> {
+    None
 }
