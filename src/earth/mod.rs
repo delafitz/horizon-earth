@@ -46,14 +46,15 @@ pub fn build_thick_lines(
     }
 }
 
-/// Latitude of the tropics (Earth's axial tilt), in degrees.
-const TROPIC_LAT: f64 = 23.4366;
+/// Half the latitude gap between the two rails of the equator's double line.
+const EQUATOR_HALF_GAP: f64 = 0.5; // degrees
 
-/// The cartographic reference graticule: the equator and the two tropics
-/// (parallels of latitude), plus the prime meridian (GMT) and the antimeridian /
-/// international date line (meridians of longitude). Each line is sampled densely
-/// so it curves smoothly on the sphere rather than chording across it. Returned
-/// as plain polylines so the caller styles them like any other line layer.
+/// The cartographic reference graticule: the equator (drawn as a thin double
+/// line — two closely-spaced parallels), plus the prime meridian (GMT) and the
+/// antimeridian / international date line (single meridians). Each line is
+/// sampled densely so it curves smoothly on the sphere rather than chording
+/// across it. Returned as plain polylines so the caller styles them like any
+/// other line layer.
 pub fn reference_lines() -> Vec<PolyLine> {
     const STEP: f64 = 2.0; // degrees between samples
     // A parallel at constant latitude, swept across every longitude.
@@ -77,11 +78,10 @@ pub fn reference_lines() -> Vec<PolyLine> {
         line
     };
     vec![
-        parallel(0.0),          // equator
-        parallel(TROPIC_LAT),   // Tropic of Cancer
-        parallel(-TROPIC_LAT),  // Tropic of Capricorn
-        meridian(0.0),          // prime meridian (GMT)
-        meridian(180.0),        // antimeridian / international date line
+        parallel(EQUATOR_HALF_GAP),  // equator, north rail
+        parallel(-EQUATOR_HALF_GAP), // equator, south rail
+        meridian(0.0),               // prime meridian (GMT)
+        meridian(180.0),             // antimeridian / international date line
     ]
 }
 

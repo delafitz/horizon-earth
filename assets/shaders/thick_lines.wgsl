@@ -15,7 +15,7 @@ struct U {
     // [egui] x = ground-line width (px), y = ground-line alpha.
     style2: vec4<f32>,
     sun: vec4<f32>, // xyz = sun direction, w = night brightness floor
-    // [egui] z = reference-graticule width (px).
+    // [egui] z = reference-graticule width (px), w = reference-graticule opacity.
     style3: vec4<f32>,
     // [egui] y = far-side ground-effects alpha.
     style4: vec4<f32>,
@@ -26,6 +26,7 @@ struct VOut {
     @builtin(position) clip: vec4<f32>,
     @location(0) col: vec3<f32>,
     @location(1) world: vec3<f32>,
+    @location(2) @interpolate(flat) layer: f32,
 };
 
 // Day/night dimming factor for a surface point (night floor -> full at the
@@ -76,6 +77,7 @@ fn vs_main(
     o.clip = c;
     o.col = col_layer.xyz;
     o.world = select(w0, w1, corner.x > 0.5);
+    o.layer = col_layer.w;
     return o;
 }
 
@@ -83,14 +85,20 @@ fn vs_main(
 fn fs_main(in: VOut) -> @location(0) vec4<f32> {
     // Alpha carries the detail-tier cross-fade weight (params.w): the renderer
     // draws the low tier with 1-blend and the high tier with blend so they
-    // dissolve into each other as the camera crosses the LOD distance.
-    return vec4<f32>(in.col * u.style0.w * shade(in.world), u.params.w);
+    // dissolve into each other as the camera crosses the LOD distance. The
+    // reference graticule (layer 3) rides its own opacity so it reads fainter
+    // than the coastlines/borders sharing this pass.
+    var a = u.params.w;
+    if (in.layer > 2.5) { a = a * u.style3.w; }
+    return vec4<f32>(in.col * u.style0.w * shade(in.world), a);
 }
 
 // Far-hemisphere variant: faint, alpha-blended (seen "through the glass").
 @fragment
 fn fs_back(in: VOut) -> @location(0) vec4<f32> {
-    return vec4<f32>(in.col * u.style0.w, u.style0.x * u.params.w);
+    var a = u.style0.x;
+    if (in.layer > 2.5) { a = a * u.style3.w; }
+    return vec4<f32>(in.col * u.style0.w, a * u.params.w);
 }
 
 // Ground anchors (nadir lines + footprint rings): alpha-blended in the body's

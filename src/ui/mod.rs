@@ -58,10 +58,12 @@ pub struct RenderSettings {
     pub border_visible: bool,
     /// Country-border stroke width in pixels.
     pub border_width: f32,
-    /// Reference graticule (equator, tropics, GMT meridian, date line).
+    /// Reference graticule (equator double line, GMT meridian, date line).
     pub reference_visible: bool,
     /// Reference-graticule stroke width in pixels.
     pub reference_width: f32,
+    /// Reference-graticule opacity (near and, scaled, far side).
+    pub reference_alpha: f32,
 
     // --- Cities ---
     pub cities_show: bool,
@@ -122,6 +124,7 @@ impl Default for RenderSettings {
             border_width: 1.4,
             reference_visible: true,
             reference_width: 1.0,
+            reference_alpha: 0.5,
             cities_show: true,
             cities_min_pop: 100_000.0,
             cities_alpha: 0.85,
@@ -505,7 +508,9 @@ fn panel_frame(ctx: &Context) -> egui::Frame {
     let style = ctx.style();
     egui::Frame {
         fill: style.visuals.panel_fill,
-        stroke: style.visuals.window_stroke,
+        // A clearly visible frost border on all four sides of the inset card
+        // (we draw no full-height separator, so this is the only outline).
+        stroke: egui::Stroke::new(1.0, Color32::from_rgb(0x61, 0x6E, 0x88)),
         rounding: egui::Rounding::same(3.0),
         inner_margin: egui::Margin::symmetric(10.0, 8.0),
         outer_margin: egui::Margin::same(8.0),
@@ -668,13 +673,18 @@ fn properties_panel(ctx: &Context, ui: &mut UiState, world: &World) {
                         .id_salt("reference")
                         .default_open(true)
                         .show(c, |g| {
-                            g.weak("equator · tropics · GMT · date line");
+                            g.weak("equator · GMT · date line");
                             g.checkbox(&mut s.reference_visible, "visible");
-                            g.add_enabled(
-                                s.reference_visible,
-                                egui::Slider::new(&mut s.reference_width, 0.5..=6.0)
-                                    .text("width px"),
-                            );
+                            g.add_enabled_ui(s.reference_visible, |g| {
+                                g.add(
+                                    egui::Slider::new(&mut s.reference_width, 0.5..=6.0)
+                                        .text("width px"),
+                                );
+                                g.add(
+                                    egui::Slider::new(&mut s.reference_alpha, 0.0..=1.0)
+                                        .text("opacity"),
+                                );
+                            });
                         });
                 });
 
@@ -772,60 +782,38 @@ fn display_panel(ctx: &Context, ui: &mut UiState, world: &World, info: &FrameInf
             p.heading("Horizon");
             p.separator();
 
-            // Clock: UTC and GMST share a line; camera heading sits underneath.
-            p.horizontal(|h| {
-                h.label(RichText::new("UTC").weak());
-                h.label(format_utc(world.current()));
-                h.add_space(6.0);
-                h.label(RichText::new("GMST").weak());
-                h.label(format!("{:.2}°", info.gmst_deg));
-            });
-            p.horizontal(|h| {
-                h.label(RichText::new("HDG").weak());
-                h.label(format!("{:.1}°", info.heading_deg));
-                h.add_space(6.0);
-                h.label(RichText::new(if ui.live { "live" } else { "demo" }).weak());
-            });
-
-            p.add_space(4.0);
-
-            // Camera motion + the live (post-filter) object count.
+            // One stat per row: a two-column (label, value) grid keeps them
+            // aligned and each on its own line.
             let shown_sats = world
                 .bodies
                 .iter()
                 .filter(|b| ui.settings.type_visible(b.category))
                 .count();
-            egui::Grid::new("status").num_columns(2).show(p, |g| {
-                g.label(RichText::new("Velocity").weak());
-                g.label(format!("{:.2} km/s", info.velocity_kms));
-                g.end_row();
-                g.label(RichText::new("Altitude").weak());
-                g.label(format!("{:.0} km", info.altitude_km));
-                g.end_row();
-                g.label(RichText::new("Zoom").weak());
-                g.label(format!("{:.2} R⊕", info.zoom));
-                g.end_row();
-                g.label(RichText::new("Satellites").weak());
-                g.label(format!("{shown_sats}"));
-                g.end_row();
-            });
-
-            p.add_space(4.0);
-
-            // Performance: frames/sec, process CPU%, and GPU main-pass time.
-            p.horizontal(|h| {
-                h.label(RichText::new("FPS").weak());
-                h.label(format!("{:.0}", info.fps));
-                h.add_space(6.0);
-                h.label(RichText::new("CPU").weak());
-                h.label(format!("{:.0}%", info.cpu_pct));
-                h.add_space(6.0);
-                h.label(RichText::new("GPU").weak());
-                match info.gpu_ms {
-                    Some(ms) => h.label(format!("{ms:.1} ms")),
-                    None => h.label("—"),
-                };
-            });
+            let gpu = match info.gpu_ms {
+                Some(ms) => format!("{ms:.1} ms"),
+                None => "—".to_owned(),
+            };
+            egui::Grid::new("status")
+                .num_columns(2)
+                .spacing(egui::vec2(12.0, 4.0))
+                .show(p, |g| {
+                    let row = |g: &mut egui::Ui, k: &str, v: String| {
+                        g.label(RichText::new(k).weak());
+                        g.label(v);
+                        g.end_row();
+                    };
+                    row(g, "UTC", format_utc(world.current()));
+                    row(g, "GMST", format!("{:.2}°", info.gmst_deg));
+                    row(g, "Heading", format!("{:.1}°", info.heading_deg));
+                    row(g, "Mode", if ui.live { "live" } else { "demo" }.to_owned());
+                    row(g, "Velocity", format!("{:.2} km/s", info.velocity_kms));
+                    row(g, "Altitude", format!("{:.0} km", info.altitude_km));
+                    row(g, "Zoom", format!("{:.2} R⊕", info.zoom));
+                    row(g, "Satellites", format!("{shown_sats}"));
+                    row(g, "FPS", format!("{:.0}", info.fps));
+                    row(g, "CPU", format!("{:.0}%", info.cpu_pct));
+                    row(g, "GPU", gpu);
+                });
 
             p.add_space(8.0);
             p.separator();

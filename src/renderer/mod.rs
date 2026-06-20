@@ -81,6 +81,7 @@ const NIGHT_DIM: f32 = 0.18;
 // Nord palette (linear-ish RGB, written directly to a non-sRGB target).
 const COLOR_COAST: [f32; 3] = [0.533, 0.753, 0.816]; // Nord8 #88C0D0
 const COLOR_BORDER: [f32; 3] = [0.298, 0.337, 0.416]; // Nord3 #4C566A
+const COLOR_REFERENCE: [f32; 3] = [0.235, 0.255, 0.298]; // muted slate — graticule
 const COLOR_LAND: [f32; 3] = [0.263, 0.298, 0.369]; // Nord3-ish land fill (low alpha)
 const COLOR_CITY: [f32; 3] = [0.533, 0.753, 0.816]; // Nord8 frost blue — city dots
 // Cities: small filled-circle markers on the surface (kind 3 in markers.wgsl).
@@ -856,11 +857,11 @@ impl Renderer {
         // it wins where they coincide. 32-bit depth resolves the tiny gap.
         crate::earth::build_thick_lines(&countries, COLOR_BORDER, 1.0, 1.0004, &mut line_insts);
         crate::earth::build_thick_lines(&coast, COLOR_COAST, 0.0, 1.0007, &mut line_insts);
-        // Reference graticule (equator, tropics, GMT meridian, date line): its
+        // Reference graticule (equator double line, GMT meridian, date line): its
         // own layer/width (style3.z), border-coloured and sharing the far-side
         // alpha. Sits a hair above the borders so it wins where they coincide.
         let reference = crate::earth::reference_lines();
-        crate::earth::build_thick_lines(&reference, COLOR_BORDER, LAYER_REFERENCE, 1.0005, &mut line_insts);
+        crate::earth::build_thick_lines(&reference, COLOR_REFERENCE, LAYER_REFERENCE, 1.0005, &mut line_insts);
         log::info!(
             "loaded {} coastline + {} country polylines = {} line segments",
             coast.len(),
@@ -928,7 +929,7 @@ impl Renderer {
             crate::earth::build_thick_lines(&countries, COLOR_BORDER, 1.0, 1.0004, &mut line_insts);
             crate::earth::build_thick_lines(&coast, COLOR_COAST, 0.0, 1.0007, &mut line_insts);
             let reference = crate::earth::reference_lines();
-            crate::earth::build_thick_lines(&reference, COLOR_BORDER, LAYER_REFERENCE, 1.0005, &mut line_insts);
+            crate::earth::build_thick_lines(&reference, COLOR_REFERENCE, LAYER_REFERENCE, 1.0005, &mut line_insts);
             let rings = crate::data::extract_polygon_rings(countries_json);
             let mut fill_verts: Vec<VertexPC> = Vec::new();
             crate::earth::build_fill(
@@ -1453,7 +1454,7 @@ impl Renderer {
                 if s.night_mode { s.cities_day_intensity } else { s.cities_night_intensity },
                 s.cities_night_intensity,
                 s.reference_width_px(), // z = reference-graticule width px (0 = hidden)
-                0.0,
+                s.reference_alpha,      // w = reference-graticule opacity
             ],
             // Far-side opacity, split per layer (Symbols is style2.z above).
             style4: [s.track_back_alpha, s.ground_back_alpha, 0.0, 0.0],
