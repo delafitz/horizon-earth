@@ -15,6 +15,10 @@ struct U {
     // [egui] x = ground-line width (px), y = ground-line alpha.
     style2: vec4<f32>,
     sun: vec4<f32>, // xyz = sun direction, w = night brightness floor
+    // [egui] z = reference-graticule width (px).
+    style3: vec4<f32>,
+    // [egui] y = far-side ground-effects alpha.
+    style4: vec4<f32>,
 };
 @group(0) @binding(0) var<uniform> u: U;
 
@@ -54,9 +58,11 @@ fn vs_main(
     let dir = normalize(d);
     let perp = vec2<f32>(-dir.y, dir.x);
 
-    // layer: 0 = coastline, 1 = border, 2 = ground anchor.
+    // layer: 0 = coastline, 1 = border, 2 = ground anchor, 3 = reference graticule.
     var width_px = u.style1.z;
-    if (col_layer.w > 1.5) {
+    if (col_layer.w > 2.5) {
+        width_px = u.style3.z;
+    } else if (col_layer.w > 1.5) {
         width_px = u.style2.x;
     } else if (col_layer.w > 0.5) {
         width_px = u.style1.w;
@@ -96,5 +102,5 @@ fn fs_ground(in: VOut) -> @location(0) vec4<f32> {
 
 @fragment
 fn fs_ground_back(in: VOut) -> @location(0) vec4<f32> {
-    return vec4<f32>(in.col, u.style2.y * u.style2.z);
+    return vec4<f32>(in.col, u.style2.y * u.style4.y);
 }

@@ -3,6 +3,7 @@
 mod glyphs;
 pub mod mesh;
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use bytemuck::{Pod, Zeroable};
@@ -124,6 +125,8 @@ const RING_SEGMENTS: usize = 48;
 const GROUND_RADIUS: f32 = 1.0015;
 // Layer value selecting the ground width in the thick-line shader.
 const LAYER_GROUND: f32 = 2.0;
+// Layer value selecting the reference-graticule width in the thick-line shader.
+const LAYER_REFERENCE: f32 = 3.0;
 // Optional sub-satellite crosshatch: a small "+" at the nadir point with arms
 // along the local meridian and parallel (graticule-aligned). Two segments per
 // body; `CROSS_HALF` is each arm's half-length in render units (Earth R = 1).
@@ -162,9 +165,11 @@ struct Uniforms {
     style1: [f32; 4], // x = atmosphere intensity, y = atmosphere outer radius,
     // z = coastline width px, w = border width px
     style2: [f32; 4], // x = ground-line width px, y = ground-line alpha,
-    // z = far-side alpha for satellite layers (tracks/markers/ground)
+    // z = far-side alpha for satellite symbols (markers)
     sun: [f32; 4], // xyz = sun direction (render frame), w = night brightness floor
-    style3: [f32; 4], // x = city day intensity, y = city night intensity
+    style3: [f32; 4], // x = city day intensity, y = city night intensity,
+    // z = reference-graticule width px
+    style4: [f32; 4], // x = far-side orbit-track alpha, y = far-side ground alpha
 }
 
 /// A city kept for rendering: earth-fixed position (spins with the globe) plus
@@ -173,6 +178,24 @@ struct CityPoint {
     name: String,
     pos: Vec3,
     pop: f32,
+}
+
+/// GPU frame-time probe: two timestamps written at the main pass boundaries,
+/// resolved into a readback buffer and mapped back (one frame later, so the GPU
+/// is never stalled). Present only when the adapter supports `TIMESTAMP_QUERY`
+/// (Vulkan/ANV and Apple Silicon do; many Intel Macs don't — then it's `None`).
+struct GpuTimer {
+    query_set: wgpu::QuerySet,
+    resolve: wgpu::Buffer,
+    readback: wgpu::Buffer,
+    /// Nanoseconds per timestamp tick (`Queue::get_timestamp_period`).
+    period_ns: f32,
+    /// Set by the map callback when a readback is ready to be consumed.
+    ready: Arc<AtomicBool>,
+    /// A readback is queued/mapped and must not be overwritten yet.
+    inflight: bool,
+    /// Last measured main-pass GPU time, in milliseconds.
+    last_ms: f32,
 }
 
 pub struct Renderer {
@@ -275,6 +298,9 @@ pub struct Renderer {
     /// Sim epoch the orbit tracks were last sampled at; re-sampled once the clock
     /// drifts past `TRACK_RESAMPLE_SECS` so precession doesn't pull them off.
     track_epoch: Epoch,
+
+    /// GPU frame-time probe; `None` when the adapter lacks timestamp queries.
+    gpu_timer: Option<GpuTimer>,
 }
 
 impl Renderer {
@@ -301,6 +327,15 @@ impl Renderer {
             .await
             .expect("no suitable GPU adapter found");
 
+        // Opt into GPU timestamp queries when the adapter offers them (Vulkan/ANV
+        // and Apple Silicon do; many Intel Macs don't). When absent we just skip
+        // the GPU-ms readout rather than fail.
+        let timestamps_ok = adapter.features().contains(wgpu::Features::TIMESTAMP_QUERY);
+        let mut required_features = wgpu::Features::DEPTH32FLOAT_STENCIL8;
+        if timestamps_ok {
+            required_features |= wgpu::Features::TIMESTAMP_QUERY;
+        }
+
         let (device, queue) = adapter
             .request_device(
                 &wgpu::DeviceDescriptor {
@@ -308,7 +343,7 @@ impl Renderer {
                     // Depth+stencil with a 32-bit float depth: keeps the fly-mode
                     // depth precision while giving a stencil plane for the
                     // land-mask clip of city dots.
-                    required_features: wgpu::Features::DEPTH32FLOAT_STENCIL8,
+                    required_features,
                     required_limits: wgpu::Limits::default(),
                     memory_hints: wgpu::MemoryHints::default(),
                 },
@@ -316,6 +351,36 @@ impl Renderer {
             )
             .await
             .expect("failed to create device");
+
+        // Build the GPU-time probe once the device exists.
+        let gpu_timer = timestamps_ok.then(|| {
+            let query_set = device.create_query_set(&wgpu::QuerySetDescriptor {
+                label: Some("gpu-frame-timer"),
+                ty: wgpu::QueryType::Timestamp,
+                count: 2,
+            });
+            let resolve = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("gpu-timer-resolve"),
+                size: 16, // 2 × u64
+                usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            });
+            let readback = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("gpu-timer-readback"),
+                size: 16,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            });
+            GpuTimer {
+                query_set,
+                resolve,
+                readback,
+                period_ns: queue.get_timestamp_period(),
+                ready: Arc::new(AtomicBool::new(false)),
+                inflight: false,
+                last_ms: 0.0,
+            }
+        });
 
         let caps = surface.get_capabilities(&adapter);
         // Prefer a non-sRGB format so our palette values display as authored.
@@ -791,6 +856,11 @@ impl Renderer {
         // it wins where they coincide. 32-bit depth resolves the tiny gap.
         crate::earth::build_thick_lines(&countries, COLOR_BORDER, 1.0, 1.0004, &mut line_insts);
         crate::earth::build_thick_lines(&coast, COLOR_COAST, 0.0, 1.0007, &mut line_insts);
+        // Reference graticule (equator, tropics, GMT meridian, date line): its
+        // own layer/width (style3.z), border-coloured and sharing the far-side
+        // alpha. Sits a hair above the borders so it wins where they coincide.
+        let reference = crate::earth::reference_lines();
+        crate::earth::build_thick_lines(&reference, COLOR_BORDER, LAYER_REFERENCE, 1.0005, &mut line_insts);
         log::info!(
             "loaded {} coastline + {} country polylines = {} line segments",
             coast.len(),
@@ -857,6 +927,8 @@ impl Renderer {
             let mut line_insts: Vec<mesh::ThickLineInstance> = Vec::new();
             crate::earth::build_thick_lines(&countries, COLOR_BORDER, 1.0, 1.0004, &mut line_insts);
             crate::earth::build_thick_lines(&coast, COLOR_COAST, 0.0, 1.0007, &mut line_insts);
+            let reference = crate::earth::reference_lines();
+            crate::earth::build_thick_lines(&reference, COLOR_BORDER, LAYER_REFERENCE, 1.0005, &mut line_insts);
             let rings = crate::data::extract_polygon_rings(countries_json);
             let mut fill_verts: Vec<VertexPC> = Vec::new();
             crate::earth::build_fill(
@@ -1075,6 +1147,7 @@ impl Renderer {
             // The track buffer above is built for every body (all categories on).
             track_mask: RenderSettings::default().track_mask(),
             track_epoch,
+            gpu_timer,
         }
     }
 
@@ -1221,6 +1294,38 @@ impl Renderer {
         self.camera.eye().length()
     }
 
+    /// Camera eye altitude above the surface, in km (both camera modes).
+    pub fn camera_altitude_km(&self) -> f64 {
+        (self.camera.eye().length() - 1.0).max(0.0) * EARTH_RADIUS_KM
+    }
+
+    /// Camera ground speed in km/s. In fly mode this is the orbital velocity
+    /// (`speed` rad/s × orbit radius); the fixed camera is stationary, so 0.
+    pub fn camera_velocity_kms(&self) -> f64 {
+        match self.camera.mode {
+            horizon_core::CameraMode::Fly => {
+                let f = &self.camera.fly;
+                f.speed * (EARTH_RADIUS_KM + f.altitude_km)
+            }
+            horizon_core::CameraMode::Fixed => 0.0,
+        }
+    }
+
+    /// Camera heading (yaw) in degrees, wrapped to `[0, 360)`.
+    pub fn camera_heading_deg(&self) -> f64 {
+        let yaw = match self.camera.mode {
+            horizon_core::CameraMode::Fly => self.camera.fly.yaw,
+            horizon_core::CameraMode::Fixed => self.camera.orbit.yaw,
+        };
+        yaw.to_degrees().rem_euclid(360.0)
+    }
+
+    /// Last measured main-pass GPU time in ms, or `None` when the adapter has no
+    /// timestamp support (so the panel can show "—").
+    pub fn gpu_ms(&self) -> Option<f32> {
+        self.gpu_timer.as_ref().map(|t| t.last_ms)
+    }
+
     pub fn resize(&mut self, width: u32, height: u32) {
         if width == 0 || height == 0 {
             return;
@@ -1286,6 +1391,11 @@ impl Renderer {
         self.camera.fly.adjust_raan(delta as f64);
     }
 
+    /// Zoom the fly camera's look (narrow/widen its field of view, radians).
+    pub fn fly_adjust_fov(&mut self, delta: f32) {
+        self.camera.fly.adjust_fov(delta as f64);
+    }
+
     /// Nudge the fly camera's attitude (yaw/pitch/roll, radians).
     pub fn fly_look(&mut self, dyaw: f32, dpitch: f32, droll: f32) {
         self.camera.fly.yaw += dyaw as f64;
@@ -1342,9 +1452,11 @@ impl Renderer {
             style3: [
                 if s.night_mode { s.cities_day_intensity } else { s.cities_night_intensity },
                 s.cities_night_intensity,
-                0.0,
+                s.reference_width_px(), // z = reference-graticule width px (0 = hidden)
                 0.0,
             ],
+            // Far-side opacity, split per layer (Symbols is style2.z above).
+            style4: [s.track_back_alpha, s.ground_back_alpha, 0.0, 0.0],
         };
         self.queue
             .write_buffer(&self.uniform_buf, 0, bytemuck::cast_slice(&[u]));
@@ -1513,14 +1625,17 @@ impl Renderer {
 
         // HUD labels: the fly-mode controls banner first (so it always shows),
         // then per-body labels (name/altitude/lat-lon), projected to screen.
+        // The whole overlay is suppressed when the HUD is toggled off (`@`).
         let mut verts: Vec<mesh::LabelVertex> = Vec::new();
-        if self.is_fly_mode() {
-            emit_fly_banner(&mut verts, width, height);
-        }
-        // Per-type label visibility is filtered inside build_labels.
-        verts.extend(self.build_labels(view_proj, eye, width, height));
-        if self.settings.cities_show && self.settings.cities_labels {
-            self.build_city_labels(view_proj, eye, spin, width, height, &mut verts);
+        if self.settings.hud {
+            if self.is_fly_mode() {
+                emit_fly_banner(&mut verts, width, height);
+            }
+            // Per-type label visibility is filtered inside build_labels.
+            verts.extend(self.build_labels(view_proj, eye, width, height));
+            if self.settings.cities_show && self.settings.cities_labels {
+                self.build_city_labels(view_proj, eye, spin, width, height, &mut verts);
+            }
         }
         verts.truncate(MAX_LABEL_VERTS);
         self.label_vcount = verts.len() as u32;
@@ -1687,6 +1802,26 @@ impl Renderer {
                 label: Some("frame"),
             });
 
+        // Consume a finished GPU-time readback (mapped a frame or two back), then
+        // decide whether to measure this frame — skipped while a readback is still
+        // in flight so we never touch a buffer that's currently mapped.
+        let measure = if let Some(t) = self.gpu_timer.as_mut() {
+            if t.inflight && t.ready.load(Ordering::Acquire) {
+                {
+                    let view = t.readback.slice(..).get_mapped_range();
+                    let t0 = u64::from_le_bytes(view[0..8].try_into().unwrap());
+                    let t1 = u64::from_le_bytes(view[8..16].try_into().unwrap());
+                    t.last_ms = t1.saturating_sub(t0) as f32 * t.period_ns / 1.0e6;
+                }
+                t.readback.unmap();
+                t.ready.store(false, Ordering::Release);
+                t.inflight = false;
+            }
+            !t.inflight
+        } else {
+            false
+        };
+
         {
             let mut rp = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("main-pass"),
@@ -1709,7 +1844,11 @@ impl Renderer {
                         store: wgpu::StoreOp::Store,
                     }),
                 }),
-                timestamp_writes: None,
+                timestamp_writes: measure.then(|| wgpu::RenderPassTimestampWrites {
+                    query_set: &self.gpu_timer.as_ref().unwrap().query_set,
+                    beginning_of_pass_write_index: Some(0),
+                    end_of_pass_write_index: Some(1),
+                }),
                 occlusion_query_set: None,
             });
 
@@ -1873,6 +2012,14 @@ impl Renderer {
             }
         }
 
+        // Resolve the main-pass timestamps into the readback buffer (the actual
+        // map happens after submit, below).
+        if measure {
+            let t = self.gpu_timer.as_ref().unwrap();
+            enc.resolve_query_set(&t.query_set, 0..2, &t.resolve, 0);
+            enc.copy_buffer_to_buffer(&t.resolve, 0, &t.readback, 0, 16);
+        }
+
         // [egui] Overlay pass: load (don't clear) the 3D scene, then paint the
         // panels on top. Buffer/texture prep records into the same encoder; any
         // returned user command buffers must run before it.
@@ -1922,6 +2069,23 @@ impl Renderer {
             for id in &eg.textures_delta.free {
                 self.egui_renderer.free_texture(id);
             }
+        }
+
+        // Kick off the (non-blocking) timestamp readback for this frame, then
+        // poll so its — and any earlier frame's — map callback can fire.
+        if measure {
+            if let Some(t) = self.gpu_timer.as_mut() {
+                let ready = t.ready.clone();
+                t.readback.slice(..).map_async(wgpu::MapMode::Read, move |res| {
+                    if res.is_ok() {
+                        ready.store(true, Ordering::Release);
+                    }
+                });
+                t.inflight = true;
+            }
+        }
+        if self.gpu_timer.is_some() {
+            self.device.poll(wgpu::Maintain::Poll);
         }
         Ok(())
     }
@@ -2167,7 +2331,7 @@ fn occluded_by_globe(eye: Vec3, p: Vec3) -> bool {
 /// is auto-sized so the whole line fits the viewport width.
 fn emit_fly_banner(out: &mut Vec<mesh::LabelVertex>, width: f32, height: f32) {
     const TEXT: &str =
-        "FLY  F:EXIT  ARROWS:LOOK  Q/E:ROLL  Z/X:SPEED  G/H:ALT  C/V:INCL  B/N:RAAN";
+        "FLY  F:FIXED  ARROWS/SCROLL:LOOK  Q/E+ROTATE:ROLL  Z/X:SPEED  G/H+PINCH:ALT  C/V:INCL  B/N:RAAN";
     const MARGIN: f32 = 20.0;
     const BANNER_PX_MAX: f32 = 16.0;
 

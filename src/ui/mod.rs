@@ -22,9 +22,12 @@ pub struct RenderSettings {
     // these are shared appearance params driven by single uniforms.
     /// Near-side orbit-track opacity.
     pub track_alpha: f32,
-    /// Far-side opacity multiplier for satellite layers (markers/tracks/ground),
-    /// seen "through the glass".
+    /// Far-side ("through the glass") opacity for satellite **symbols** (markers).
     pub sat_back_alpha: f32,
+    /// Far-side opacity for orbit **tracks**.
+    pub track_back_alpha: f32,
+    /// Far-side opacity for **ground effects** (nadir lines + footprint rings).
+    pub ground_back_alpha: f32,
     /// Ground-anchor (nadir line + footprint ring) stroke width in pixels.
     pub ground_width: f32,
     /// Ground-anchor opacity.
@@ -55,6 +58,10 @@ pub struct RenderSettings {
     pub border_visible: bool,
     /// Country-border stroke width in pixels.
     pub border_width: f32,
+    /// Reference graticule (equator, tropics, GMT meridian, date line).
+    pub reference_visible: bool,
+    /// Reference-graticule stroke width in pixels.
+    pub reference_width: f32,
 
     // --- Cities ---
     pub cities_show: bool,
@@ -84,13 +91,21 @@ pub struct RenderSettings {
     pub atmo_intensity: f32,
     /// Shell reach above the surface (outer radius = 1.0 + this).
     pub atmo_thickness: f32,
+
+    // --- HUD ---
+    /// Master toggle for the on-screen overlay (vector labels + fly banner, and
+    /// the egui control panels). Flipped at runtime with `@`. When off, only the
+    /// globe and scene remain — a clean view.
+    pub hud: bool,
 }
 
 impl Default for RenderSettings {
     fn default() -> Self {
         Self {
             track_alpha: 0.35,
-            sat_back_alpha: 0.15,
+            sat_back_alpha: 0.0,
+            track_back_alpha: 0.0,
+            ground_back_alpha: 0.0,
             ground_width: 1.5,
             ground_alpha: 0.5,
             label_size: 24.0,
@@ -99,12 +114,14 @@ impl Default for RenderSettings {
             marker_intensity: 1.0,
             types: default_types(),
             line_brightness: 1.0,
-            line_back_alpha: 0.1,
+            line_back_alpha: 0.2,
             fill_alpha: 0.35,
             coast_visible: true,
             coast_width: 2.0,
             border_visible: true,
             border_width: 1.4,
+            reference_visible: true,
+            reference_width: 1.0,
             cities_show: true,
             cities_min_pop: 100_000.0,
             cities_alpha: 0.85,
@@ -116,6 +133,7 @@ impl Default for RenderSettings {
             show_atmosphere: true,
             atmo_intensity: 0.45,
             atmo_thickness: 0.06,
+            hud: true,
         }
     }
 }
@@ -150,6 +168,12 @@ impl RenderSettings {
     pub fn label_visible(&self, cat: Category) -> bool {
         let t = self.ty(cat);
         t.visible && t.show_labels
+    }
+
+    /// Whether bodies of category `cat` are currently shown (the per-type master
+    /// `visible` toggle) — used for the live "Satellites" count.
+    pub fn type_visible(&self, cat: Category) -> bool {
+        self.ty(cat).visible
     }
 
     /// Whether the ground anchor (nadir drop-line) for category `cat` should be
@@ -204,6 +228,16 @@ impl RenderSettings {
     pub fn border_width_px(&self) -> f32 {
         if self.border_visible {
             self.border_width
+        } else {
+            0.0
+        }
+    }
+
+    /// Reference-graticule stroke width in px, `0.0` when hidden (a zero-width
+    /// segment collapses to nothing in the thick-line shader).
+    pub fn reference_width_px(&self) -> f32 {
+        if self.reference_visible {
+            self.reference_width
         } else {
             0.0
         }
@@ -352,8 +386,18 @@ impl UiState {
 pub struct FrameInfo {
     pub fps: f32,
     pub gmst_deg: f64,
+    /// Camera heading (yaw), degrees in `[0, 360)`.
+    pub heading_deg: f64,
+    /// Camera speed in km/s (orbital velocity in fly mode, 0 when fixed).
+    pub velocity_kms: f64,
+    /// Camera eye altitude above the surface, in km.
+    pub altitude_km: f64,
     /// Camera distance from Earth-center, in Earth radii (the zoom level).
     pub zoom: f64,
+    /// Process CPU usage, percent of one core.
+    pub cpu_pct: f32,
+    /// Main-pass GPU time in ms, or `None` when timestamps are unsupported.
+    pub gpu_ms: Option<f32>,
 }
 
 /// Install the lightweight, translucent "Nord wireframe" theme: panels tinted
@@ -361,7 +405,9 @@ pub struct FrameInfo {
 /// rather than filled blocks, and no drop shadows.
 pub fn install_theme(ctx: &Context) {
     use egui::style::{Selection, WidgetVisuals, Widgets};
-    use egui::{FontData, FontDefinitions, FontFamily, Rounding, Stroke, Style, Visuals};
+    use egui::{
+        FontData, FontDefinitions, FontFamily, FontId, Rounding, Stroke, Style, TextStyle, Visuals,
+    };
 
     // Geo (embedded) as the default proportional + monospace face. Falls in
     // front of egui's built-ins so all panel text uses it, with the originals
@@ -431,8 +477,21 @@ pub fn install_theme(ctx: &Context) {
     style.visuals = visuals;
     // A little extra spacing reads as "lightweight".
     style.spacing.item_spacing = egui::vec2(8.0, 6.0);
+    // Bump the type scale up from egui's defaults for a more legible HUD.
+    style.text_styles = [
+        (TextStyle::Heading, FontId::new(22.0, FontFamily::Proportional)),
+        (TextStyle::Body, FontId::new(16.0, FontFamily::Proportional)),
+        (TextStyle::Monospace, FontId::new(15.0, FontFamily::Monospace)),
+        (TextStyle::Button, FontId::new(16.0, FontFamily::Proportional)),
+        (TextStyle::Small, FontId::new(13.0, FontFamily::Proportional)),
+    ]
+    .into();
     ctx.set_style(style);
 }
+
+/// Shared fixed width for both side panels (the config panel's width). Panels are
+/// non-resizable, so neither shows a drag handle.
+const PANEL_WIDTH: f32 = 280.0;
 
 /// Build both panels for this frame.
 pub fn draw(ctx: &Context, ui: &mut UiState, world: &World, info: &FrameInfo) {
@@ -458,8 +517,9 @@ fn panel_frame(ctx: &Context) -> egui::Frame {
 /// body.
 fn properties_panel(ctx: &Context, ui: &mut UiState, world: &World) {
     egui::SidePanel::right("properties")
-        .resizable(true)
-        .default_width(240.0)
+        .resizable(false)
+        .show_separator_line(false)
+        .exact_width(PANEL_WIDTH)
         .frame(panel_frame(ctx))
         .show(ctx, |p| {
             p.heading("Properties");
@@ -481,7 +541,21 @@ fn properties_panel(ctx: &Context, ui: &mut UiState, world: &World) {
             let s = &mut ui.settings;
             p.add_space(6.0);
 
-            p.checkbox(&mut s.night_mode, "Day / night shading");
+            p.checkbox(&mut s.night_mode, "Day / Night Mode");
+            p.add_space(6.0);
+
+            // Far-side ("through the glass") opacity for each layer, consolidated.
+            egui::CollapsingHeader::new("Far Side")
+                .default_open(true)
+                .show(p, |c| {
+                    c.add(egui::Slider::new(&mut s.line_back_alpha, 0.0..=1.0).text("Land"));
+                    c.add(egui::Slider::new(&mut s.sat_back_alpha, 0.0..=1.0).text("Symbols"));
+                    c.add(egui::Slider::new(&mut s.track_back_alpha, 0.0..=1.0).text("Orbits"));
+                    c.add(
+                        egui::Slider::new(&mut s.ground_back_alpha, 0.0..=1.0)
+                            .text("Ground Effects"),
+                    );
+                });
             p.add_space(6.0);
 
             egui::CollapsingHeader::new("Satellites")
@@ -490,10 +564,6 @@ fn properties_panel(ctx: &Context, ui: &mut UiState, world: &World) {
                     // Shared appearance (single uniforms); per-type size/labels/
                     // tracks/ground toggles live in the type nodes below.
                     c.add(egui::Slider::new(&mut s.track_alpha, 0.0..=1.0).text("track opacity"));
-                    c.add(
-                        egui::Slider::new(&mut s.sat_back_alpha, 0.0..=1.0)
-                            .text("far-side opacity"),
-                    );
                     c.add(
                         egui::Slider::new(&mut s.marker_size, 0.25..=4.0).text("symbol size ×"),
                     );
@@ -566,15 +636,11 @@ fn properties_panel(ctx: &Context, ui: &mut UiState, world: &World) {
             egui::CollapsingHeader::new("Land")
                 .default_open(false)
                 .show(p, |c| {
-                    // Shared across both line layers (one brightness / far-side
-                    // alpha uniform drives coastlines and borders alike).
+                    // Shared across both line layers (one brightness uniform drives
+                    // coastlines and borders alike; far-side opacity is in Far Side).
                     c.add(
                         egui::Slider::new(&mut s.line_brightness, 0.2..=2.0)
                             .text("line brightness"),
-                    );
-                    c.add(
-                        egui::Slider::new(&mut s.line_back_alpha, 0.0..=1.0)
-                            .text("far-side lines"),
                     );
                     c.add(egui::Slider::new(&mut s.fill_alpha, 0.0..=1.0).text("land fill"));
 
@@ -596,6 +662,18 @@ fn properties_panel(ctx: &Context, ui: &mut UiState, world: &World) {
                             g.add_enabled(
                                 s.border_visible,
                                 egui::Slider::new(&mut s.border_width, 0.5..=6.0).text("width px"),
+                            );
+                        });
+                    egui::CollapsingHeader::new("Reference lines")
+                        .id_salt("reference")
+                        .default_open(true)
+                        .show(c, |g| {
+                            g.weak("equator · tropics · GMT · date line");
+                            g.checkbox(&mut s.reference_visible, "visible");
+                            g.add_enabled(
+                                s.reference_visible,
+                                egui::Slider::new(&mut s.reference_width, 0.5..=6.0)
+                                    .text("width px"),
                             );
                         });
                 });
@@ -686,32 +764,67 @@ fn inspector(p: &mut egui::Ui, world: &World, i: usize) {
 /// Left side: clock/status readout and the scrollable, filterable body list.
 fn display_panel(ctx: &Context, ui: &mut UiState, world: &World, info: &FrameInfo) {
     egui::SidePanel::left("display")
-        .resizable(true)
-        .default_width(260.0)
+        .resizable(false)
+        .show_separator_line(false)
+        .exact_width(PANEL_WIDTH)
         .frame(panel_frame(ctx))
         .show(ctx, |p| {
             p.heading("Horizon");
             p.separator();
 
+            // Clock: UTC and GMST share a line; camera heading sits underneath.
+            p.horizontal(|h| {
+                h.label(RichText::new("UTC").weak());
+                h.label(format_utc(world.current()));
+                h.add_space(6.0);
+                h.label(RichText::new("GMST").weak());
+                h.label(format!("{:.2}°", info.gmst_deg));
+            });
+            p.horizontal(|h| {
+                h.label(RichText::new("HDG").weak());
+                h.label(format!("{:.1}°", info.heading_deg));
+                h.add_space(6.0);
+                h.label(RichText::new(if ui.live { "live" } else { "demo" }).weak());
+            });
+
+            p.add_space(4.0);
+
+            // Camera motion + the live (post-filter) object count.
+            let shown_sats = world
+                .bodies
+                .iter()
+                .filter(|b| ui.settings.type_visible(b.category))
+                .count();
             egui::Grid::new("status").num_columns(2).show(p, |g| {
-                g.label("UTC");
-                g.label(format_utc(world.current()));
+                g.label(RichText::new("Velocity").weak());
+                g.label(format!("{:.2} km/s", info.velocity_kms));
                 g.end_row();
-                g.label("GMST");
-                g.label(format!("{:.2}°", info.gmst_deg));
+                g.label(RichText::new("Altitude").weak());
+                g.label(format!("{:.0} km", info.altitude_km));
                 g.end_row();
-                g.label("mode");
-                g.label(if ui.live { "live" } else { "demo" });
+                g.label(RichText::new("Zoom").weak());
+                g.label(format!("{:.2} R⊕", info.zoom));
                 g.end_row();
-                g.label("objects");
-                g.label(format!("{}", world.bodies.len()));
+                g.label(RichText::new("Satellites").weak());
+                g.label(format!("{shown_sats}"));
                 g.end_row();
-                g.label("zoom");
-                g.label(format!("{:.1} R⊕", info.zoom));
-                g.end_row();
-                g.label("fps");
-                g.label(format!("{:.0}", info.fps));
-                g.end_row();
+            });
+
+            p.add_space(4.0);
+
+            // Performance: frames/sec, process CPU%, and GPU main-pass time.
+            p.horizontal(|h| {
+                h.label(RichText::new("FPS").weak());
+                h.label(format!("{:.0}", info.fps));
+                h.add_space(6.0);
+                h.label(RichText::new("CPU").weak());
+                h.label(format!("{:.0}%", info.cpu_pct));
+                h.add_space(6.0);
+                h.label(RichText::new("GPU").weak());
+                match info.gpu_ms {
+                    Some(ms) => h.label(format!("{ms:.1} ms")),
+                    None => h.label("—"),
+                };
             });
 
             p.add_space(8.0);

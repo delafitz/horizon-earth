@@ -46,6 +46,45 @@ pub fn build_thick_lines(
     }
 }
 
+/// Latitude of the tropics (Earth's axial tilt), in degrees.
+const TROPIC_LAT: f64 = 23.4366;
+
+/// The cartographic reference graticule: the equator and the two tropics
+/// (parallels of latitude), plus the prime meridian (GMT) and the antimeridian /
+/// international date line (meridians of longitude). Each line is sampled densely
+/// so it curves smoothly on the sphere rather than chording across it. Returned
+/// as plain polylines so the caller styles them like any other line layer.
+pub fn reference_lines() -> Vec<PolyLine> {
+    const STEP: f64 = 2.0; // degrees between samples
+    // A parallel at constant latitude, swept across every longitude.
+    let parallel = |lat: f64| -> PolyLine {
+        let mut line = Vec::new();
+        let mut lon = -180.0;
+        while lon <= 180.0 + 1e-6 {
+            line.push([lon, lat]);
+            lon += STEP;
+        }
+        line
+    };
+    // A meridian at constant longitude, swept pole to pole.
+    let meridian = |lon: f64| -> PolyLine {
+        let mut line = Vec::new();
+        let mut lat = -90.0;
+        while lat <= 90.0 + 1e-6 {
+            line.push([lon, lat]);
+            lat += STEP;
+        }
+        line
+    };
+    vec![
+        parallel(0.0),          // equator
+        parallel(TROPIC_LAT),   // Tropic of Cancer
+        parallel(-TROPIC_LAT),  // Tropic of Capricorn
+        meridian(0.0),          // prime meridian (GMT)
+        meridian(180.0),        // antimeridian / international date line
+    ]
+}
+
 /// Triangulate the closed rings in lon/lat and emit clip-space 2D vertices
 /// (x = lon/180, y = lat/90) for baking the equirectangular land mask. No
 /// subdivision is needed (it's a flat 2D raster), so the triangulation tiles
